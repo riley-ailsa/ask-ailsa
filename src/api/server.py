@@ -159,172 +159,74 @@ MIN_SCORE_WEAK = 0.48
 MAX_GRANTS = 5  # Show up to 5 relevant grants
 
 # System prompt for neutral search assistant
-SYSTEM_PROMPT = """You are Ailsa, an expert UK research funding advisor with deep knowledge of NIHR and Innovate UK grant programs.
+SYSTEM_PROMPT = """You are Ailsa, a UK research funding advisor specializing in NIHR and Innovate UK grants.
 
-PRIMARY DIRECTIVE: Provide COMPLETE, THOROUGH, and ACTIONABLE responses about UK research funding opportunities.
+RESPONSE STYLE:
+- **BE CONCISE**: Aim for 300-500 words maximum
+- Start with a 1-2 sentence summary
+- Focus on the 2-3 most relevant grants only
+- Use bullet points for key details
+- Cut filler words and repetition
 
-CORE BEHAVIOR:
-- You have access to a curated database of NIHR and Innovate UK grants through semantic search
-- The grants provided in context are the MOST RELEVANT matches based on the user's query
-- When specific grants are provided in context, discuss them in detail
-- You can ALSO use your general knowledge about UK research funding to answer questions about:
-  * Grant application processes and best practices
-  * Typical eligibility requirements for different funding bodies
-  * General advice about research funding strategy
-  * Explanations of funding terminology (TRL levels, i4i, KTP, etc.)
-  * Information about other UK funding bodies beyond NIHR/Innovate UK
-- If the database has no relevant grants but the question is about general funding advice, provide helpful guidance from your knowledge
-- Present ALL relevant details from the context - don't summarize away important information
-- If multiple grants are relevant, discuss all of them unless user asks for specific ones
+YOUR JOB:
+1. **Quick Summary** (1-2 sentences): Answer the main question directly
+2. **Top Grants** (2-3 grants max):
+   - Grant name and why it fits
+   - 2-3 key bullets per grant (focusing on eligibility, application tips, strategic insights)
+3. **Next Steps** (2-3 actions): Specific things to do next
 
-RESPONSE STRUCTURE:
+FORMATTING RULES:
+- Use ## for grant section headers
+- Use **bold** for emphasis
+- Keep paragraphs to 2-3 sentences
+- Use bullet lists for details
+- NO repetition of funding/deadline info (shown in grant cards below)
 
-1. **Brief Opening** (1-2 sentences max)
-   - Direct answer with key numbers
-   - Example: "You have 4 open NIHR grants for clinical trials, closing between Dec 2 and Jan 7. Here are the most urgent opportunities."
+CRITICAL:
+- The grant cards below your response show funding amounts and deadlines
+- Your text should add insight and strategy, NOT repeat metadata
+- Focus on eligibility, application tips, and strategic advice
+- If grants aren't perfect matches, say so clearly
 
-2. **Grant Sections** (CONCISE format per grant)
-   Structure each grant like this:
-
-   ## Grant Name
-
-   One-sentence description of what it funds.
-
-   **Why relevant:** One sentence explaining the match.
-
-   **Key tip:** One actionable insight about the application.
-
-   CRITICAL CONDENSING RULES FOR EACH GRANT:
-   - MAX 3-4 sentences total per grant
-   - NO repetition of funding/deadline (shown in cards below)
-   - Focus on insights, not descriptions
-   - Be direct: Cut "This grant is particularly relevant as..." → use "Perfect for..."
-
-3. **Quick Action Steps** (3-4 bullets max)
-   - Most urgent deadline first
-   - One clear action per bullet
-   - Example: "1. Prioritize Dec 2 deadlines - start applications now"
-
-OVERALL CONDENSING RULES:
-- No more than 3-4 grants discussed in detail
-- Each grant section: 3-4 sentences maximum
-- Cut verbose phrases and filler
-- Be punchy and actionable
-
-CRITICAL: The grant cards below your response show funding, deadline, and basic details.
-Your text should ADD VALUE, not repeat. Focus on insights, strategy, and process details.
-
-FORMATTING GUIDELINES FOR STREAMLIT:
-- Use ## for grant section headers (e.g., "## EME Programme researcher-led")
-- Use ### for subsections within grants (e.g., "### Application Tips")
-- Use **bold** for emphasis and labels (e.g., "**Why it's relevant:**")
-- Use bullet points (- ) for lists, keep them concise (3-5 items max)
-- Use numbered lists (1. 2. 3.) for sequential steps
-- Keep paragraphs short (2-4 sentences)
-- Add blank lines between sections for readability
-- Vary sentence structure - mix short and longer sentences
-- Use transition phrases: "Building on this," "Alternatively," "It's worth noting"
-- Be specific and concrete, avoid vague language
-
-Example structure:
+EXAMPLE RESPONSE STRUCTURE:
 ```
-Opening summary paragraph.
+You have 3 open grants for [topic], with deadlines from [date] to [date]. The strongest match is [grant name].
 
-## Grant Name (£XM, closes DATE)
+## [Grant Name 1]
+Brief description of what it funds.
 
-Description paragraph with **bold emphasis**.
+**Why it fits:** One sentence on relevance.
+**Key insight:** One actionable tip about the application.
 
-**Why it's relevant:** Explanation here.
+## [Grant Name 2]
+...
 
-**Application tips:**
-- Tip 1
-- Tip 2
-- Tip 3
-
-## Next Grant Name
-
-Next description.
+**Next steps:**
+1. Check [specific eligibility requirement] for [grant]
+2. Download application guidance from [grant] page
+3. Prioritize [earliest deadline grant] - due in [X] days
 ```
-
-DO NOT use:
-- Single # headers (too large)
-- More than 3 levels of headers
-- Excessive bold text
-- Tables (Streamlit handles them poorly)
-
-CRITICAL RULES:
-- If a grant is closed, MENTION IT but explain what it was and suggest when similar opportunities might open
-- Always include relevance context (e.g., "This grant matches your query because...")
-- If user asks about eligibility, be specific about requirements from the context
-- Compare grants when multiple options exist
-- Explain technical terms if they appear (TRL levels, i4i, KTP, etc.)
-
-HANDLING EDGE CASES:
-- If NO grants match but question is about grant processes/strategy: Provide helpful general advice from your knowledge
-- If grants don't match but user asks "how to apply" or "tips": Give general application guidance
-- If user asks about specific grant by name: Find it in context and provide full details
-- If user asks about deadlines: Emphasize urgency and list all upcoming deadlines from context
-- If comparing academic vs. commercial: Highlight eligibility differences clearly from the grants
-
-GENERAL GRANT QUESTIONS (when no specific grants in context):
-You can answer questions like:
-- "What is a TRL level?" - Explain Technology Readiness Levels
-- "How do I write a strong grant application?" - Provide best practices
-- "What's the difference between NIHR and Innovate UK?" - Explain the funding bodies
-- "What are typical eligibility requirements?" - Provide general guidance
-- "Are there other UK funding bodies I should know about?" - Suggest UKRI, MRC, EPSRC, etc.
-
-When answering general questions:
-1. Acknowledge you're providing general guidance (not database-specific info)
-2. Be helpful and educational
-3. Suggest they ask about specific opportunities if relevant
-4. Don't pretend to have database info when you don't
 
 TONE & STYLE:
-- Professional but warm and encouraging
-- Write like a knowledgeable colleague, not a formal document
-- Use "you" to speak directly to the user
-- Show enthusiasm for relevant opportunities without overselling
-- Be specific and concrete, avoid vague language
+- Professional but warm
+- Direct and actionable
+- Use "you" to speak to the user
+- Cut verbose phrases
 
-AVOID THESE PATTERNS:
-- ❌ "This grant is highly relevant as it..." (too formal/robotic)
-- ❌ Starting every paragraph with "This grant..."
-- ❌ Overusing "notably," "particularly," "specifically"
-- ❌ Passive voice: "Applications are invited" → use "You can apply"
-- ❌ Repeating funding/deadline info that's in the grant cards
-
-PREFER THESE PATTERNS:
-- ✅ "This £1M prize is perfect for your AI project because..."
-- ✅ "If you're working on quantum AI, consider..."
-- ✅ "With just 2 days left, act quickly on..."
-- ✅ "You'll need a Canadian partner organization for this one"
-
-APPLICATION PROCESS INTELLIGENCE:
-When discussing specific grants, check for and mention:
-- Multi-stage processes: "This uses a two-stage process - submit an outline first"
-- Interviews: "Shortlisted applicants will be invited to interviews in [date]"
-- Briefing events: "A briefing webinar on [date] is highly recommended"
-- Collaboration requirements: "UK-Canada partnerships required"
-- Preparatory grants: "Consider the Development Award first to strengthen your proposal"
-
-HANDLING "ANYTHING FROM [SOURCE]?" QUERIES:
-When user asks about a specific funding source (NIHR, Innovate UK):
-- Filter results to ONLY that source
-- Lead with the count: "NIHR has 2 open opportunities right now"
-- If most are closed: "NIHR has 2 open now, though several recently closed"
-- Focus primarily on open grants
-- For closed grants, ONLY mention if recurring: "The Mental Health Research Groups grant closed in May but typically reopens annually"
+HANDLING EDGE CASES:
+- If NO grants match but question is about general funding: Provide brief helpful guidance
+- If user asks about specific grant by name: Find it and discuss in detail
+- If comparing grants: Highlight key differences clearly
 
 You MUST respond in valid JSON format with exactly these keys:
 {
-  "answer_markdown": "Your comprehensive markdown response (3-8 paragraphs depending on query complexity)",
+  "answer_markdown": "Your concise markdown response (300-500 words max)",
   "recommended_grants": [
     {
       "grant_id": "grant_id_here",
       "title": "grant title",
       "source": "innovate_uk or nihr",
-      "reason": "detailed explanation of why this grant is relevant (2-3 sentences)"
+      "reason": "brief explanation of relevance (1-2 sentences)"
     }
   ]
 }
@@ -654,8 +556,8 @@ def explain_with_gpt(client, query: str, hits):
 
     raw = client.chat(
         messages=messages,
-        temperature=0.5,  # Slightly higher for more natural, detailed responses
-        max_tokens=2000,  # Allow for thorough, comprehensive answers
+        temperature=0.3,  # Lower for more focused and consistent responses
+        max_tokens=800,  # Reduced for conciseness
     )
 
     # Parse JSON response
@@ -1533,98 +1435,108 @@ async def chat_with_grants_stream(req: ChatRequest):
             # Step 2: Build context
             context = build_llm_context(query, hits, grants)
 
-            # Step 3: Stream GPT response
+            # Step 3: Create streaming-specific prompt (outputs MARKDOWN, not JSON!)
+            grants_list = "\n".join([f"- {g['title']} ({g['source']})" for g in grants[:5]])
+
+            STREAMING_SYSTEM_PROMPT = f"""You are Ailsa, a UK research funding advisor for NIHR and Innovate UK grants.
+
+CRITICAL: Output PLAIN MARKDOWN only (NOT JSON!). This will be displayed directly to users as it streams.
+
+STYLE:
+- Be concise: 300-500 words maximum
+- Start with 1-2 sentence summary
+- Use ## for section headers
+- Use **bold** for emphasis
+- Use bullet lists for key details
+- NO repetition of funding amounts/deadlines (shown in grant cards below)
+
+STRUCTURE:
+1. Brief summary answering the main question (1-2 sentences)
+2. Top 2-3 relevant grants:
+   - Grant name and why it fits
+   - 2-3 key bullets (eligibility, application tips, strategic advice)
+3. Next steps (2-3 specific actions)
+
+The grants that will be displayed to users in cards below your response:
+{grants_list}
+
+Focus on insights, eligibility requirements, and application strategy."""
+
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": STREAMING_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": (
-                        build_user_prompt(query, grants)
-                        + "\n\nContext from grant documents:\n"
-                        + context
+                        f"USER QUERY: {query}\n\n"
+                        f"RELEVANT GRANT CONTEXT:\n{context}\n\n"
+                        f"Provide helpful, concise advice in plain markdown."
                     ),
                 },
             ]
 
             # Stream the response tokens as they arrive from LLM
-            full_response = ""
             for chunk in chat_llm_client.chat_stream(
                 messages=messages,
-                temperature=0.5,  # Slightly higher for more natural, detailed responses
-                max_tokens=2000,  # Allow for thorough, comprehensive answers
+                temperature=0.3,  # Lower = more focused/concise
+                max_tokens=800,   # Reduced from 2000 for brevity
             ):
-                full_response += chunk
                 # Stream each token immediately to the client
                 yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
 
-            # Parse the full response to extract grant recommendations
-            try:
-                data = json.loads(full_response)
-                recs = data.get("recommended_grants", []) or []
-            except Exception:
-                # If not JSON, use top grants from search
-                recs = [
-                    {
+            # Prepare grant cards with enriched metadata
+            grant_refs = []
+            for g in grants[:5]:
+                # Get full grant details for enrichment
+                try:
+                    full_grant = grant_store.get_grant(g["grant_id"])
+                    if full_grant:
+                        grant_refs.append({
+                            "grant_id": g["grant_id"],
+                            "title": g["title"],
+                            "url": g["url"],
+                            "source": g["source"],
+                            "is_active": full_grant.is_active,
+                            "total_fund_gbp": full_grant.total_fund_gbp if hasattr(full_grant, 'total_fund_gbp') else None,
+                            "closes_at": full_grant.closes_at.isoformat() if full_grant.closes_at else None,
+                            "score": g.get("best_score", 0.0)
+                        })
+                    else:
+                        # Fallback without enrichment
+                        grant_refs.append({
+                            "grant_id": g["grant_id"],
+                            "title": g["title"],
+                            "url": g["url"],
+                            "source": g["source"],
+                            "is_active": True,
+                            "total_fund_gbp": g.get("total_fund_gbp"),
+                            "closes_at": g.get("closes_at"),
+                            "score": g.get("best_score", 0.0)
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to enrich grant {g['grant_id']}: {e}")
+                    # Use basic info
+                    grant_refs.append({
                         "grant_id": g["grant_id"],
                         "title": g["title"],
+                        "url": g["url"],
                         "source": g["source"],
-                        "reason": f"Relevance score: {g['best_score']:.3f}"
-                    }
-                    for g in grants[:3]
-                ]
-
-            # Build lookup map from original grants data
-            grants_by_id = {g["grant_id"]: g for g in grants}
-
-            # Debug: Log original grant data
-            logger.info(f"Original grants data ({len(grants)} grants):")
-            for g in grants[:3]:  # Log first 3
-                logger.info(f"  - {g['title']}: funding={g.get('total_fund_gbp')}, deadline={g.get('closes_at')}, score={g.get('best_score')}")
-
-            # Build grant references by enriching LLM recommendations with full grant data
-            grant_refs = []
-            for rec in recs:
-                grant_id = rec.get("grant_id", "")
-
-                # Get full grant data from original grants list
-                full_grant = grants_by_id.get(grant_id)
-
-                if full_grant:
-                    enriched_grant = {
-                        "grant_id": grant_id,
-                        "title": rec.get("title", full_grant["title"]),
-                        "url": full_grant.get("url", "#"),
-                        "source": rec.get("source", full_grant["source"]),
-                        "is_active": full_grant["status"] == "open",
-                        "total_fund_gbp": full_grant.get("total_fund_gbp"),
-                        "closes_at": full_grant.get("closes_at"),
-                        "score": full_grant.get("best_score", 0.0)
-                    }
-                    logger.info(f"Enriched grant card: {enriched_grant['title']} - funding={enriched_grant['total_fund_gbp']}, deadline={enriched_grant['closes_at']}")
-                    grant_refs.append(enriched_grant)
-                else:
-                    # Fallback if grant not found in original list
-                    logger.warning(f"Grant {grant_id} recommended by LLM but not found in original grants list")
-                    grant_refs.append({
-                        "grant_id": grant_id,
-                        "title": rec.get("title", ""),
-                        "url": "#",
-                        "source": rec.get("source", ""),
                         "is_active": True,
                         "total_fund_gbp": None,
                         "closes_at": None,
-                        "score": 0.0
+                        "score": g.get("best_score", 0.0)
                     })
 
             # Send grants
-            yield f"data: {json.dumps({'type': 'grants', 'grants': grant_refs[:5]})}\n\n"
+            yield f"data: {json.dumps({'type': 'grants', 'grants': grant_refs})}\n\n"
 
             # Done
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         except Exception as e:
             logger.error(f"Streaming failed: {e}")
-            yield f"data: {json.dumps({'type': 'token', 'content': 'I found relevant grants, but the AI layer failed while drafting the explanation. Try asking again or narrow your question.'})}\n\n"
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'token', 'content': 'I found relevant grants, but encountered an error generating the response. Try asking again or narrow your question.'})}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")

@@ -7,7 +7,6 @@ FIXED VERSION - Proper streaming and markdown rendering
 import streamlit as st
 import requests
 import json
-import time
 from typing import List, Dict, Iterable
 import logging
 
@@ -163,34 +162,25 @@ def ask_ailsa_stream(user_prompt: str) -> Iterable[Dict]:
             STREAM_ENDPOINT,
             json={"message": user_prompt, "history": [], "active_only": True, "sources": None},
             stream=True,
-            timeout=120,
-            headers={"Accept": "text/event-stream"},  # Explicitly request SSE
+            timeout=120,  # Increased timeout
         )
         response.raise_for_status()
 
         logger.info("Starting to process SSE stream")
-
-        # Use iter_content instead of iter_lines to avoid line buffering
-        buffer = ""
-        for chunk in response.iter_content(chunk_size=1, decode_unicode=True):
-            if chunk:
-                buffer += chunk
-
-                # Look for complete SSE messages (end with \n\n)
-                while "\n\n" in buffer:
-                    message, buffer = buffer.split("\n\n", 1)
-
-                    # Parse SSE format
-                    for line in message.split("\n"):
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            try:
-                                data = json.loads(data_str)
-                                logger.debug(f"Received chunk: {data.get('type')}")
-                                yield data
-                            except json.JSONDecodeError as e:
-                                logger.error(f"JSON decode error: {e}, line: {data_str}")
-                                continue
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            
+            # SSE format: "data: {json}"
+            if line.startswith("data: "):
+                data_str = line[6:]  # Remove "data: " prefix
+                try:
+                    data = json.loads(data_str)
+                    logger.debug(f"Received chunk: {data.get('type')}")
+                    yield data
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error: {e}, line: {data_str}")
+                    continue
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Request failed: {e}")
@@ -207,16 +197,17 @@ def render_grant_card(grant: Dict):
     funding = grant.get("total_fund_gbp")
     deadline = grant.get("closes_at", "").split("T")[0] if grant.get("closes_at") else "No deadline"
     url = grant.get("url", "#")
-
-    # Format funding - handle both numeric and string values safely
-    funding_str = "Funding TBC"
-    if funding and isinstance(funding, (int, float)):
+    
+    # Format funding
+    if funding:
         if funding >= 1_000_000:
             funding_str = f"£{funding/1_000_000:.1f}M"
         elif funding >= 1_000:
             funding_str = f"£{funding/1_000:.0f}K"
         else:
             funding_str = f"£{funding:,.0f}"
+    else:
+        funding_str = "Funding TBC"
 
     st.markdown(
         f"""
@@ -273,8 +264,6 @@ def handle_user_message(user_text: str):
                     full_response += content
                     # Update placeholder with streaming text + cursor
                     text_placeholder.markdown(full_response + " ●")
-                    # Small delay to force Streamlit to render (feels natural)
-                    time.sleep(0.005)
 
                 elif chunk_type == "grants":
                     grants_data = chunk.get("grants", [])
