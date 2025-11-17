@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# Database files (use volume mounts instead)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Checkpoints and temporary files
+processed_urls.txt
+*.log
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Tests
+tests/
+test_*/
+*_test.py
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Environment files (use docker-compose env instead)
+.env
+.env.local
+.env.production
