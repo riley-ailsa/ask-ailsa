@@ -60,3 +60,4 @@ evaluation_queries.json
 # Python cache
 *.pyc
 slack/.env.slack
+*.backup_*

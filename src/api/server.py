@@ -308,7 +308,7 @@ def _grant_to_summary(grant: Grant) -> GrantSummary:
 
 
 # Scoring thresholds for grant filtering
-MIN_SCORE_STRONG = 0.55
+MIN_SCORE_STRONG = 0.40  # Lowered from 0.55 to be more inclusive
 MIN_SCORE_WEAK = 0.48
 MAX_GRANTS = 3  # Show up to 3 relevant grants (quality over quantity)
 
@@ -537,6 +537,71 @@ def should_include_grant_recommendations(query: str, response: str) -> bool:
     return has_grant_intent
 
 
+def add_diversity_to_grants(
+    grant_scores: list,
+    max_grants: int = 5,
+    diversity_weight: float = 0.15,
+) -> list:
+    """
+    Select diverse grants using a diversity penalty.
+
+    This prevents the same grant (or very similar grants from the same source/type)
+    from dominating recommendations.
+
+    Args:
+        grant_scores: List of grant dicts with 'best_score', 'source', 'title'
+        max_grants: Maximum number of grants to return
+        diversity_weight: How much to penalize similarity (0.0-1.0)
+
+    Returns:
+        Diversified list of grants
+    """
+    if not grant_scores or max_grants <= 0:
+        return []
+
+    selected = []
+    remaining = grant_scores.copy()
+
+    while len(selected) < max_grants and remaining:
+        if not selected:
+            # First grant: just take the highest score
+            best = remaining.pop(0)
+            selected.append(best)
+            continue
+
+        # For subsequent grants, apply diversity penalty
+        best_idx = 0
+        best_adjusted_score = -1
+
+        for i, candidate in enumerate(remaining):
+            base_score = candidate['best_score']
+
+            # Calculate diversity penalty
+            penalty = 0
+            for already_selected in selected:
+                # Same source penalty
+                if candidate['source'] == already_selected['source']:
+                    penalty += diversity_weight * 0.5
+
+                # Same category/type penalty (if titles are very similar)
+                title_words_cand = set(candidate['title'].lower().split())
+                title_words_sel = set(already_selected['title'].lower().split())
+                overlap = len(title_words_cand & title_words_sel) / max(len(title_words_cand), 1)
+
+                if overlap > 0.5:  # More than 50% word overlap
+                    penalty += diversity_weight * 0.3
+
+            adjusted_score = base_score - penalty
+
+            if adjusted_score > best_adjusted_score:
+                best_adjusted_score = adjusted_score
+                best_idx = i
+
+        selected.append(remaining.pop(best_idx))
+
+    return selected
+
+
 def select_top_grants(hits, query: str = ""):
     """
     Filter and deduplicate grants by score threshold with semantic boosting.
@@ -621,6 +686,9 @@ def select_top_grants(hits, query: str = ""):
     if any(phrase in query_lower for phrase in ['all grants', 'show me everything', 'complete list', 'all options', 'show more', 'what else']):
         max_grants = 5
         logger.info(f"User requested comprehensive list, showing up to {max_grants} grants")
+
+    # Apply diversity to prevent same grant dominating results
+    open_grants = add_diversity_to_grants(open_grants, max_grants=max_grants, diversity_weight=0.15)
 
     # Prioritize open grants - only show closed if very few open options
     relevant = open_grants[:max_grants]
