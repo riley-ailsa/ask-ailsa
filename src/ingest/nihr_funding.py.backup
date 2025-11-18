@@ -611,209 +611,13 @@ class NihrFundingScraper:
 
         return key_dates
 
-    def _find_tab_navigation(self, soup: BeautifulSoup) -> List[tuple[str, str]]:
-        """
-        Detect tab-based navigation in NIHR pages.
-
-        NIHR pages often use tabs with structure like:
-            <ul class="nav nav-tabs" or similar>
-              <li><a href="#tab-overview">Overview</a></li>
-              <li><a href="#tab-applications">Applications</a></li>
-              <li><a href="#tab-eligibility">Eligibility</a></li>
-            </ul>
-
-        Returns:
-            List of (tab_name, tab_id) tuples, e.g.:
-            [("Overview", "tab-overview"), ("Applications", "tab-applications")]
-        """
-        tabs = []
-
-        # Strategy 1 (PRIORITY): Look for links with href="#tab-*" pattern in main content area
-        # This is the most reliable indicator of content tabs (not nav/footer)
-        main = soup.find("main") or soup
-        for link in main.find_all("a", href=re.compile(r"^#tab-")):
-            href = link.get("href", "").strip()
-            tab_id = href[1:]
-            tab_name = link.get_text(strip=True)
-
-            if tab_name and tab_id:
-                tabs.append((tab_name, tab_id))
-                logger.debug(f"Found tab (main #tab-*): {tab_name} -> #{tab_id}")
-
-        # Strategy 2: If no #tab-* found, look for tab containers in main content
-        if not tabs:
-            tab_containers = main.find_all("ul", class_=re.compile(r"(tab)", re.I))
-
-            for container in tab_containers:
-                # Skip if container is in footer or nav
-                parent_classes = " ".join(container.get("class", []))
-                if "footer" in parent_classes.lower() or "navbar" in parent_classes.lower():
-                    continue
-
-                for link in container.find_all("a", href=True):
-                    href = link.get("href", "").strip()
-
-                    # Must be a fragment link
-                    if not href.startswith("#"):
-                        continue
-
-                    # Skip footer/nav patterns like #collapse-*, #panel-*
-                    if href.startswith("#collapse-") or href.startswith("#panel-"):
-                        continue
-
-                    # Extract tab ID (remove #)
-                    tab_id = href[1:]
-
-                    # Get tab name from link text
-                    tab_name = link.get_text(strip=True)
-
-                    # Skip empty names or IDs
-                    if not tab_name or not tab_id:
-                        continue
-
-                    tabs.append((tab_name, tab_id))
-                    logger.debug(f"Found tab (container): {tab_name} -> #{tab_id}")
-
-        # Deduplicate by tab_id while preserving order
-        seen_ids = set()
-        unique_tabs = []
-        for name, tid in tabs:
-            if tid not in seen_ids:
-                seen_ids.add(tid)
-                unique_tabs.append((name, tid))
-
-        if unique_tabs:
-            logger.info(f"Detected {len(unique_tabs)} tabs on page")
-
-        return unique_tabs
-
-    def _extract_tab_content(self, soup: BeautifulSoup, tab_id: str) -> Optional[dict]:
-        """
-        Extract HTML and text content from a specific tab panel.
-
-        Tab content is typically in a <div> with id="tab-overview" or similar.
-
-        Structure:
-            <div id="tab-overview" class="tab-pane" ...>
-              <h2>Some heading</h2>
-              <p>Content here...</p>
-            </div>
-
-        Args:
-            soup: Parsed HTML
-            tab_id: Tab panel ID (without #), e.g., "tab-overview"
-
-        Returns:
-            dict with 'html' and 'text' keys, or None if not found
-        """
-        # Find element with this ID
-        tab_panel = soup.find(id=tab_id)
-
-        if not tab_panel:
-            logger.warning(f"Tab panel not found: #{tab_id}")
-            return None
-
-        # Extract HTML (everything inside the tab panel)
-        html = str(tab_panel)
-
-        # Extract text (cleaned)
-        # Use BeautifulSoup's stripped_strings to get clean text
-        text_parts = []
-        for element in tab_panel.stripped_strings:
-            text_parts.append(element)
-
-        text = " ".join(text_parts)
-
-        # Log content size
-        logger.debug(f"Tab #{tab_id}: {len(html)} chars HTML, {len(text)} chars text")
-
-        return {
-            "html": html,
-            "text": text
-        }
-
-    def _parse_sections_with_tabs(self, soup: BeautifulSoup, page_url: str) -> List[NihrSection]:
-        """
-        NEW MAIN METHOD: Parse sections with tab awareness.
-
-        This replaces _parse_sections_from_headings as the primary parser.
-
-        Strategy:
-        1. Detect if page has tab navigation
-        2. If yes: Extract content from each tab panel
-        3. If no: Fall back to h2 heading-based parsing
-
-        Args:
-            soup: Parsed HTML
-            page_url: Base URL for constructing section URLs
-
-        Returns:
-            List of NihrSection objects
-        """
-        # Try to detect tabs
-        tabs = self._find_tab_navigation(soup)
-
-        if tabs:
-            logger.info(f"Using tab-based section extraction ({len(tabs)} tabs)")
-            return self._parse_sections_from_tabs(soup, page_url, tabs)
-        else:
-            logger.info("No tabs detected, using h2-based section extraction")
-            return self._parse_sections_from_headings(soup, page_url)
-
-    def _parse_sections_from_tabs(
-        self,
-        soup: BeautifulSoup,
-        page_url: str,
-        tabs: List[tuple[str, str]]
-    ) -> List[NihrSection]:
-        """
-        Extract sections by walking through each tab panel.
-
-        Args:
-            soup: Parsed HTML
-            page_url: Base URL
-            tabs: List of (tab_name, tab_id) tuples
-
-        Returns:
-            List of NihrSection objects
-        """
-        sections = []
-
-        for tab_name, tab_id in tabs:
-            # Extract content from this tab
-            content = self._extract_tab_content(soup, tab_id)
-
-            if not content:
-                logger.warning(f"Skipping tab {tab_name} (no content found)")
-                continue
-
-            # Create section
-            slug = _slugify(tab_name)
-            source_url = f"{page_url}#{tab_id}"
-
-            section = NihrSection(
-                name=tab_name,
-                slug=slug,
-                html=content["html"],
-                text=content["text"],
-                source_url=source_url
-            )
-
-            sections.append(section)
-            logger.debug(f"Extracted tab section: {tab_name} ({len(content['text'])} chars)")
-
-        return sections
-
     def _parse_sections_from_nav(self, base_url: str, soup: BeautifulSoup) -> List[Dict[str, Any]]:
         """
-        Main entry point for section parsing (called by _scrape_funding_page).
-
-        NOW TAB-AWARE: Detects and handles tabbed content.
-
-        Returns dict format for backward compatibility with normalizer.
+        DEPRECATED: Old navigation-based section parser.
+        Replaced by _parse_sections_from_headings for better coverage.
         """
-        # Use new tab-aware parser
-        sections = self._parse_sections_with_tabs(soup, base_url)
+        # Call new heading-based parser
+        sections = self._parse_sections_from_headings(soup, base_url)
 
         # Convert NihrSection objects to dicts for backward compatibility
         return [
@@ -897,33 +701,12 @@ class NihrFundingScraper:
     ) -> List[Dict[str, Any]]:
         """
         Extract all resources from sections.
-
-        FIXED: Uses the sections that were already parsed (preserving tab content)
-        instead of re-parsing with old h2 method.
-
-        Args:
-            base_url: Page URL
-            soup: Parsed HTML (kept for backward compatibility, not used)
-            sections: Already-parsed sections (from tab-aware parser)
-
-        Returns:
-            List of resource dicts
+        Calls new _extract_resources_from_sections and converts to dict format.
         """
-        # Convert dict sections back to NihrSection objects
-        # These sections already contain tab content from tab-aware parsing
-        section_objs = []
-        for s in sections:
-            section_objs.append(
-                NihrSection(
-                    name=s["title"],
-                    slug=s.get("slug", _slugify(s["title"])),
-                    html=s["html"],
-                    text=s["text"],
-                    source_url=s["url"]
-                )
-            )
+        # Get section objects (re-parse if needed)
+        section_objs = self._parse_sections_from_headings(soup, base_url)
 
-        # Extract resources from these sections (preserving tab content)
+        # Call new resource extractor
         resources = self._extract_resources_from_sections(section_objs, base_url)
 
         # Convert NihrResource objects to dicts for backward compatibility
