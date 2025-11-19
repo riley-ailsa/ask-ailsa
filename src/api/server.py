@@ -102,15 +102,21 @@ def search_expert_knowledge(query: str, limit: int = 5) -> str:
     Returns:
         Formatted knowledge context or empty string
     """
-    # Extract keywords from query
-    keywords = query.lower().split()
+    # Stop words to filter out (common words that don't help with relevance)
+    STOP_WORDS = {'is', 'are', 'the', 'a', 'an', 'to', 'for', 'of', 'in', 'on', 'at',
+                  'there', 'it', 'be', 'and', 'or', 'but', 'what', 'where', 'when',
+                  'how', 'why', 'i', 'me', 'my'}
+
+    # Extract keywords from query (filter out stop words and short words)
+    keywords = [k for k in query.lower().split() if k not in STOP_WORDS and len(k) > 2]
 
     # Add synonyms for common terms
     expanded_keywords = set(keywords)
     if 'trl' in query.lower():
-        expanded_keywords.update(['technology', 'readiness', 'level'])
+        expanded_keywords.update(['technology', 'readiness', 'level', 'levels'])
+        expanded_keywords.add('trl')  # Make sure TRL itself is included
     if 'link' in query.lower() or 'url' in query.lower():
-        expanded_keywords.update(['http', 'www', 'resource'])
+        expanded_keywords.update(['http', 'www', 'resource', 'source'])
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -132,11 +138,20 @@ def search_expert_knowledge(query: str, limit: int = 5) -> str:
 
         for keyword in expanded_keywords:
             if keyword in combined_text:
-                score += combined_text.count(keyword)
+                count = combined_text.count(keyword)
+                # Weight important keywords more heavily
+                if keyword in ['trl', 'technology', 'readiness']:
+                    score += count * 3  # Triple weight for key terms
+                else:
+                    score += count
 
         # Boost URL content when user asks for links
         if ('link' in query.lower() or 'url' in query.lower()) and 'http' in expert_response:
-            score += 5
+            score += 10  # Increased from 5
+
+        # Extra boost for TRL-specific content when TRL is mentioned
+        if 'trl' in query.lower() and 'technology readiness level' in combined_text:
+            score += 20
 
         if score > 0:
             results.append({
