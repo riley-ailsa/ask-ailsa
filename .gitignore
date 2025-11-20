@@ -61,3 +61,5 @@ evaluation_queries.json
 *.pyc
 slack/.env.slack
 *.backup_*
+pinecone_metadata_backup_*.json
+*.log

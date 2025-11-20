@@ -47,7 +47,7 @@ except ImportError:
 # We're in slack/ folder, so go up one level to project root
 project_root = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(project_root))
-from scripts.add_expert_example import add_expert_example
+from scripts.sme.add_expert_example import add_expert_example
 
 # Configuration from environment variables
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")

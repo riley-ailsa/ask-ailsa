@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 
 BACKEND_URL = "http://localhost:8000"
-STREAM_ENDPOINT = f"{BACKEND_URL}/chat/stream"
+# Use enhanced endpoint with conversation context and strategic advisory
+STREAM_ENDPOINT = f"{BACKEND_URL}/chat/enhanced/stream"
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG & STYLING
@@ -147,6 +148,15 @@ if "messages" not in st.session_state:
 
 if "pending_sample_question" not in st.session_state:
     st.session_state.pending_sample_question = None
+
+# Session ID for conversation tracking
+if "session_id" not in st.session_state:
+    import uuid
+    st.session_state.session_id = str(uuid.uuid4())[:8]
+
+# User profile extracted from conversation
+if "user_profile" not in st.session_state:
+    st.session_state.user_profile = {}
 
 # ─────────────────────────────────────────────────────────────
 # BACKEND COMMUNICATION
@@ -332,28 +342,50 @@ with st.sidebar:
     st.markdown(
         """
         **Ask Ailsa** helps you discover UK research funding through conversational AI.
-        
-        - 🔍 Semantic search across NIHR & Innovate UK
-        - 💬 Natural language queries
-        - 📊 Relevance-ranked results
-        - 🎯 Smart filtering by deadline, amount, eligibility
+
+        - Conversation memory across queries
+        - Strategic funding advice via GPT-5.1
+        - Eligibility-based filtering
+        - Smart intent recognition
         """
     )
+
+    st.markdown("---")
+    st.markdown("### Your Profile")
+
+    profile = st.session_state.user_profile
+    if profile:
+        if profile.get("organization_type"):
+            st.markdown(f"**Organization:** {profile['organization_type']}")
+        if profile.get("sector"):
+            sectors = profile['sector'] if isinstance(profile['sector'], list) else [profile['sector']]
+            st.markdown(f"**Sectors:** {', '.join(sectors)}")
+        if profile.get("has_partnerships"):
+            st.markdown("✓ Has partnerships")
+        if profile.get("has_patented_tech"):
+            st.markdown("✓ Has patented tech")
+        if profile.get("funding_range"):
+            fr = profile["funding_range"]
+            min_f = fr.get("min", 0)
+            max_f = fr.get("max", 0)
+            st.markdown(f"**Funding range:** £{min_f:,} - £{max_f:,}")
+    else:
+        st.markdown("_Tell me about your organization to get better recommendations!_")
 
     st.markdown("---")
     st.markdown("### Tips")
     st.markdown(
         """
-        - Be specific about your research area
-        - Ask about deadlines or funding amounts
-        - Request comparisons between grants
+        - Mention your organization type (SME, university, etc.)
+        - Share your sector and stage
+        - Ask for comparisons between specific grants
         - Follow up to refine results
         """
     )
 
     st.markdown("---")
     st.markdown("### Data Sources")
-    st.markdown("🏥 NIHR Funding  \n💡 Innovate UK Competitions")
+    st.markdown("NIHR Funding  \nInnovate UK Competitions")
 
     if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = [
@@ -363,6 +395,8 @@ with st.sidebar:
                 "grants": []
             }
         ]
+        st.session_state.user_profile = {}
+        st.session_state.session_id = str(__import__('uuid').uuid4())[:8]
         st.rerun()
 
 # Header

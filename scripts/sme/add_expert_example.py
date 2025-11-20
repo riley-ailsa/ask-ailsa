@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "grants.db"
+DB_PATH = Path(__file__).parent.parent.parent / "grants.db"
 
 def add_expert_example(
     user_query: str,

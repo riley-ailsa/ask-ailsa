@@ -3255,6 +3255,115 @@ Remember: You're chatting with a founder over coffee, not writing a grant databa
 
 
 # -----------------------------------------------------------------------------
+# Enhanced Chat with Context & Strategic Advisory
+# -----------------------------------------------------------------------------
+
+# Enhanced search instance (initialized on first use)
+enhanced_search_instance = None
+
+
+@app.post("/chat/enhanced/stream")
+async def chat_enhanced_stream(req: ChatRequest):
+    """
+    Enhanced streaming chat with conversation context and strategic advisory.
+
+    Features:
+    - Conversation memory across queries
+    - User profile extraction
+    - Intent classification
+    - Eligibility filtering
+    - Strategic advice via GPT-5.1
+    """
+    import json
+    import uuid
+
+    global enhanced_search_instance
+
+    query = req.message.strip()
+    if not query:
+        async def empty_generator():
+            yield f"data: {json.dumps({'type': 'token', 'content': 'Ask me something about funding.'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(empty_generator(), media_type="text/event-stream")
+
+    logger.info(f"/chat/enhanced/stream query: {query!r}")
+
+    # Initialize enhanced search on first use
+    if enhanced_search_instance is None:
+        try:
+            import sys
+            import os
+            # Add project root to path
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+            from backend.enhanced_search import EnhancedGrantSearch
+            enhanced_search_instance = EnhancedGrantSearch(
+                db_path=DB_PATH,
+                vector_index=vector_index
+            )
+            logger.info("✓ Initialized Enhanced Search with GPT-5.1 strategic advisor")
+        except Exception as e:
+            logger.error(f"✗ Failed to initialize enhanced search: {e}")
+            import traceback
+            traceback.print_exc()
+            async def error_generator():
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Enhanced search not available'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return StreamingResponse(error_generator(), media_type="text/event-stream")
+
+    # Generate session ID from history or create new one
+    # In production, you'd extract this from authentication/cookies
+    session_id = str(uuid.uuid4())[:8]  # Short session ID for demo
+
+    async def generate():
+        try:
+            # Run enhanced search
+            result = enhanced_search_instance.search(
+                query=query,
+                session_id=session_id,
+                top_k=10,
+                active_only=req.active_only if hasattr(req, 'active_only') else True
+            )
+
+            # Stream the response text
+            response_text = result["response"]
+
+            # Stream word by word for natural feel
+            words = response_text.split()
+            for i, word in enumerate(words):
+                # Add space before word except for first word
+                content = word if i == 0 else f" {word}"
+                yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+
+            # Send grants
+            if result["grants"]:
+                grants_json = []
+                for g in result["grants"]:
+                    grants_json.append({
+                        "grant_id": g["grant_id"],
+                        "title": g["title"],
+                        "source": g["source"],
+                        "total_fund_gbp": g.get("total_fund_gbp"),
+                        "closes_at": g.get("closes_at"),
+                        "url": g.get("url", "#")
+                    })
+
+                yield f"data: {json.dumps({'type': 'grants', 'grants': grants_json})}\n\n"
+
+            # Send completion
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        except Exception as e:
+            logger.error(f"Enhanced search stream error: {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+# -----------------------------------------------------------------------------
 # Startup Event
 # -----------------------------------------------------------------------------
 
