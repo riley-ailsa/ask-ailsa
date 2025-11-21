@@ -46,6 +46,19 @@ Recently discussed grants: {', '.join(recent_grants[:5]) if recent_grants else '
 
 {self._format_intents()}
 
+IMPORTANT - FOLLOW-UP DETECTION:
+If the query is a short question about dates, deadlines, funding amounts, requirements, or application process WITHOUT naming a specific grant, classify as "followup" if there are recently discussed grants.
+
+Examples of FOLLOW-UP queries:
+- "what are the dates?" (after discussing Biomedical Catalyst)
+- "how much funding?" (after discussing i4i Programme)
+- "what's the deadline?" (after discussing Horizon Europe)
+- "who can apply?" (after discussing any grant)
+- "tell me more" (after any discussion)
+- "how do I apply?" (after discussing grants)
+
+These should be "followup" NOT "discovery" - the user wants info about what was JUST discussed.
+
 Context:
 {context_summary}
 

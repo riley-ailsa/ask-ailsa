@@ -19,10 +19,14 @@ from typing import List, Optional
 
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+
+# Load environment variables from .env file
+load_dotenv()
 
 from src.api.schemas import (
     HealthResponse,
@@ -40,11 +44,32 @@ from src.api.schemas import (
     ChatGrant,
     ChatResponse,
 )
-from src.storage.grant_store import GrantStore
-from src.storage.document_store import DocumentStore
+from src.storage.postgres_store import PostgresGrantStore
 from src.storage.explanation_cache import ExplanationCache
-from src.index.vector_index import VectorIndex
+from src.storage.pinecone_index import PineconeVectorIndex
 from src.core.domain_models import Grant
+
+
+# -----------------------------------------------------------------------------
+# VectorHit Class for Compatibility
+# -----------------------------------------------------------------------------
+
+class VectorHit:
+    """
+    Search result wrapper for compatibility with existing code.
+
+    Converts Pinecone results to expected format with grant_id, score, metadata.
+    """
+    def __init__(self, grant_id: str, score: float, metadata: dict, grant: Optional[Grant] = None):
+        self.grant_id = grant_id
+        self.score = score
+        self.metadata = metadata
+        self.doc_id = grant_id  # For compatibility
+        self.chunk_index = 0
+        self.source_url = grant.url if grant else metadata.get("url", "")
+        self.text = grant.description if grant else metadata.get("description", "")
+        # Store full grant for easy access
+        self._grant = grant
 
 
 # Configure logging
@@ -72,10 +97,11 @@ app.add_middleware(
 
 
 # Initialize storage and index
+grant_store = PostgresGrantStore()
+vector_index = PineconeVectorIndex()
+
+# Keep SQLite for explanation cache (not migrated yet)
 DB_PATH = "grants.db"
-grant_store = GrantStore(DB_PATH)
-doc_store = DocumentStore(DB_PATH)
-vector_index = VectorIndex(db_path=DB_PATH)
 explanation_cache = ExplanationCache(DB_PATH)
 
 # LLM client (initialized on first use)
@@ -83,6 +109,144 @@ llm_client: Optional['LLMClient'] = None
 
 # Chat LLM client (initialized lazily)
 chat_llm_client = None
+
+
+# =============================================================================
+# Hybrid RAG Helper Functions
+# =============================================================================
+
+def hybrid_search(
+    query: str,
+    top_k: int = 10,
+    source: Optional[str] = None,
+    status: Optional[str] = None,
+    active_only: bool = False
+) -> List[Grant]:
+    """
+    Hybrid RAG search: Pinecone (vectors) + PostgreSQL (full grant details).
+
+    Architecture:
+    1. Search Pinecone for semantically similar grant IDs
+    2. Fetch full grant details from PostgreSQL
+    3. Enrich with relevance scores
+    4. Sort by relevance
+
+    Args:
+        query: Search query text
+        top_k: Number of results to return
+        source: Optional filter by source (e.g., "nihr", "innovate_uk")
+        status: Optional filter by status (e.g., "Open", "Closed")
+        active_only: If True, only return active grants
+
+    Returns:
+        List of Grant objects with relevance_score attribute added
+    """
+    # Step 1: Vector search in Pinecone
+    vector_results = vector_index.search(
+        query=query,
+        top_k=top_k * 2,  # Over-fetch for filtering
+        source=source,
+        status=status
+    )
+
+    if not vector_results:
+        logger.info(f"Pinecone returned no results for query: {query[:50]}...")
+        return []
+
+    # Step 2: Extract grant IDs and scores
+    # Note: Pinecone has two formats:
+    # - Horizon Europe: vector ID is the grant ID
+    # - NIHR/Innovate UK: vector ID is chunk ID, but metadata['grant_id'] has actual grant ID
+    grant_ids_with_scores = []
+    for r in vector_results:
+        # Try to get grant_id from metadata first, fallback to vector ID
+        grant_id = r['metadata'].get('grant_id', r['grant_id'])
+        grant_ids_with_scores.append((grant_id, r['score'], r['metadata']))
+
+    # Deduplicate grant IDs (same grant might have multiple chunks)
+    seen = {}
+    for grant_id, score, metadata in grant_ids_with_scores:
+        if grant_id not in seen or score > seen[grant_id][0]:
+            seen[grant_id] = (score, metadata)
+
+    grant_ids = list(seen.keys())
+    scores = {gid: seen[gid][0] for gid in grant_ids}
+    metadata_map = {gid: seen[gid][1] for gid in grant_ids}
+
+    logger.info(f"Pinecone returned {len(grant_ids)} unique grant IDs from {len(vector_results)} vectors")
+
+    # Step 3: Fetch full grant details from PostgreSQL (bulk)
+    grants = grant_store.get_grants_by_ids(grant_ids)
+    logger.info(f"PostgreSQL returned {len(grants)} grants")
+
+    # Step 4: Filter and enrich with scores
+    enriched_grants = []
+    for grant in grants:
+        # Apply active_only filter
+        if active_only and not grant.is_active:
+            continue
+
+        # Enrich with relevance score and metadata (Grant uses 'id' not 'grant_id')
+        grant.relevance_score = scores.get(grant.id, 0.0)
+        grant.search_metadata = metadata_map.get(grant.id, {})
+        enriched_grants.append(grant)
+
+    # Step 5: Sort by relevance score (highest first)
+    enriched_grants.sort(key=lambda g: g.relevance_score, reverse=True)
+
+    logger.info(f"Hybrid search returned {len(enriched_grants[:top_k])} results after filtering")
+
+    return enriched_grants[:top_k]
+
+
+def build_grant_context(query: str, grants: List[Grant], verbose: bool = False) -> str:
+    """
+    Build context string for LLM from grant data.
+
+    Args:
+        query: User's search query
+        grants: List of Grant objects
+        verbose: If True, include more details
+
+    Returns:
+        Formatted context string for LLM
+    """
+    if not grants:
+        return "No relevant grants found."
+
+    context = f"User query: {query}\n\n"
+    context += f"Found {len(grants)} relevant grants:\n\n"
+
+    for i, grant in enumerate(grants, 1):
+        context += f"{i}. {grant.title}\n"
+        context += f"   ID: {grant.id}\n"
+        context += f"   Source: {grant.source}\n"
+        context += f"   Status: {'Active' if grant.is_active else 'Closed'}\n"
+
+        if grant.closes_at:
+            context += f"   Deadline: {grant.closes_at.strftime('%Y-%m-%d')}\n"
+
+        if grant.total_fund:
+            context += f"   Funding: {grant.total_fund}\n"
+
+        if verbose and grant.description:
+            # Include more description in verbose mode
+            desc = grant.description[:500] if len(grant.description) > 500 else grant.description
+            context += f"   Description: {desc}\n"
+        elif grant.description:
+            # Just a snippet in normal mode
+            desc = grant.description[:200] if len(grant.description) > 200 else grant.description
+            context += f"   Summary: {desc}...\n"
+
+        context += f"   URL: {grant.url}\n"
+
+        # Add relevance score if available
+        if hasattr(grant, 'relevance_score'):
+            context += f"   Relevance: {grant.relevance_score:.3f}\n"
+
+        context += "\n"
+
+    return context
 
 
 # -----------------------------------------------------------------------------
@@ -379,70 +543,53 @@ MIN_SCORE_STRONG = 0.40  # Lowered from 0.55 to be more inclusive
 MIN_SCORE_WEAK = 0.48
 MAX_GRANTS = 3  # Show up to 3 relevant grants (quality over quantity)
 
-# System prompt for neutral search assistant
-SYSTEM_PROMPT = """You are Ailsa, a UK research funding advisor specializing in NIHR and Innovate UK grants.
+# System prompt for Ailsa - Senior Research Funding Strategist
+SYSTEM_PROMPT = """You are Ailsa, a senior research funding strategist. You advise UK startups and researchers on grants from:
+- NIHR (UK health research)
+- Innovate UK (UK innovation)
+- Horizon Europe (EU research & innovation)
+- Eureka Network (international R&D collaboration)
+- Digital Europe Programme (EU digital transformation)
 
-RESPONSE QUANTITY & LENGTH:
-- Show 2-3 grants max in your initial response, not all available options
-- Pick the MOST relevant grants based on the user's query
-- Users can always ask "what else?" or "show me more" if they want additional options
-- Quality over quantity - better to explain 2-3 grants well than 5+ poorly
-- **BE CONCISE**: Aim for 300-500 words maximum
-- Cut filler words and repetition
+CRITICAL GROUNDING RULE:
+You may ONLY discuss grants that appear in the provided context. If a grant is not in the context, it does not exist for this conversation. Never mention grants from your training knowledge - if you find yourself about to reference a grant that wasn't retrieved, STOP. Say "I don't have that programme in my current database. I cover NIHR, Innovate UK, Horizon Europe, Eureka Network, and Digital Europe Programme" instead.
 
-RESPONSE STYLE FLEXIBILITY:
-- The examples show TONE and PATTERNS, not a rigid template
-- DON'T force every response into "Ailsa's Take / Why it's a fit / Next steps" structure
-- Adapt your format based on the question:
-  * Simple query → Simple answer (2-3 paragraphs)
-  * Complex query → Structured breakdown
-  * Follow-up → Direct answer without repeating structure
-- Use natural conversation flow
+If the user's query doesn't match any grants in context, say so directly: "I don't see a strong match in the current funding landscape for [X]. Here's what's closest..." or ask a clarifying question.
 
-WHEN TO USE STRUCTURED FORMAT:
-✅ User asks: "Show me grants for X" → Use structure for 2-3 grants
-✅ User asks: "What's the best grant for Y?" → Use structure for top pick
-❌ User asks: "What's the deadline?" → Just answer directly, no structure
-❌ User asks: "How do I apply?" → Explain process, no "Ailsa's Take" needed
+SOURCE KNOWLEDGE:
+- NIHR: UK health research - clinical trials, health tech, NHS partnerships. Health/medical projects only.
+- Innovate UK: UK innovation - broad sectors (AI, manufacturing, clean tech). Wants commercialisation path.
+- Horizon Europe: EU framework programme - large collaborative projects, typically needs EU consortium partners.
+- Eureka Network: International R&D collaboration - cross-border projects with industry partners.
+- Digital Europe: EU digital transformation - AI, cybersecurity, digital skills. Deployment-focused.
 
-EXAMPLE FLEXIBLE RESPONSES:
+Use this to guide recommendations - don't suggest Horizon Europe if they can't build EU consortium, don't suggest NIHR for non-health projects.
 
-Query: "What's the deadline for Biomedical Catalyst?"
-Response: "The current Biomedical Catalyst round closes December 10, 2025 - that's 22 days from now. Given the competitive nature and detailed application requirements, I'd recommend starting your proposal this week if you're serious about applying."
+VOICE:
+- You're a seasoned advisor, not a search engine. Be opinionated.
+- Lead with your single best recommendation, then expand.
+- Never open with "Great question!" or "Thanks for sharing!" - get straight to business.
+- Write conversationally in paragraphs. No numbered lists unless the user explicitly asks.
+- Match the user's urgency. If they mention competitors or runway pressure, that shapes your advice.
 
-Query: "Should I apply for loans or grants?"
-Response: "Depends on your financial position and timeline. Grants are non-repayable but highly competitive (10-20% success rates). Innovation Loans give you more flexibility with 3.7% rates during the project, but Innovate UK's Credit team will scrutinize your ability to repay. What's your current runway and revenue situation?"
+RESPONSE STRUCTURE:
+1. Lead with your top recommendation (1-2 sentences)
+2. Explain why it fits their specific situation (reference their TRL, sector, funding need, etc.)
+3. Address timing/deadlines if relevant
+4. Surface 1-2 alternatives if appropriate (from different sources if relevant)
+5. Close with ONE clarifying question or concrete next step
 
-Query: "Show me medical device grants"
-Response: [Use full structured format for 2-3 top grants]
+Keep responses focused. Aim for 200-400 words unless the query genuinely requires more.
 
-FORMATTING RULES:
-- Use ## for grant section headers (when appropriate)
-- Use **bold** for emphasis
-- Keep paragraphs to 2-3 sentences
-- Use bullet lists for details when helpful
-- NO repetition of funding/deadline info (shown in grant cards below)
-
-CRITICAL:
-- The grant cards below your response show funding amounts and deadlines
-- Your text should add insight and strategy, NOT repeat metadata
-- Focus on eligibility, application tips, and strategic advice
-- If grants aren't perfect matches, say so clearly
-
-TONE & STYLE:
-- Professional but warm
-- Direct and actionable
-- Use "you" to speak to the user
-- Vary your style based on the question type
-
-HANDLING EDGE CASES:
-- If NO grants match but question is about general funding: Provide brief helpful guidance
-- If user asks about specific grant by name: Find it and discuss in detail
-- If comparing grants: Highlight key differences clearly
+WHAT YOU DON'T DO:
+- Invent grant details, deadlines, or funding amounts not in context
+- Recommend grants that are paused, closed, or not in the database
+- Give generic advice that could apply to anyone
+- Dump every possible option - curate ruthlessly
 
 You MUST respond in valid JSON format with exactly these keys:
 {
-  "answer_markdown": "Your concise markdown response (300-500 words max)",
+  "answer_markdown": "Your focused, opinionated response (200-400 words)",
   "recommended_grants": [
     {
       "grant_id": "grant_id_here",
@@ -461,28 +608,27 @@ Available grants from semantic search (ranked by relevance):
 {grant_summaries}
 
 Your task:
-1. Write a COMPREHENSIVE response that addresses the user's question thoroughly
-2. Analyze ALL grants provided and discuss the most relevant ones in detail
-3. Include specific information: funding amounts, deadlines, eligibility, and why each grant matches
-4. Select up to 5 most relevant grants for the recommended_grants list (score >= {min_score_strong})
-5. Do NOT hallucinate grants - only reference grants provided above
+1. Pick your TOP recommendation from the grants above and lead with it
+2. Explain why it fits their specific situation (TRL, sector, timing, funding need)
+3. Mention 1-2 alternatives if appropriate
+4. Close with ONE clarifying question or concrete next step
+5. Select 2-3 most relevant grants for recommended_grants (max 3, score >= {min_score_strong})
 
-IMPORTANT INSTRUCTIONS:
-- Use the grant information above to provide detailed, actionable advice
-- Explain WHY each grant is relevant to the user's specific question
-- If grants are closed, mention them and explain when similar opportunities might be available
-- Include funding amounts and deadlines prominently
-- Use markdown formatting for readability (bold for key info, bullets for lists)
-- Be thorough but well-organized - aim for 3-8 paragraphs depending on complexity
-- The grant cards will appear below your response, so provide context and analysis, not just repetition
+CRITICAL:
+- ONLY discuss grants provided above. If none fit well, say so directly.
+- Be opinionated and strategic, not comprehensive and encyclopedic
+- Write in conversational paragraphs, not numbered lists (unless user explicitly asks)
+- Match the user's urgency and context
+- Don't open with pleasantries - get straight to business
+- Aim for 200-400 words, not 500+
 
 Respond in valid JSON with keys:
-- "answer_markdown": comprehensive markdown-formatted response that thoroughly addresses the query
-- "recommended_grants": a list (max 5) of the most relevant grants with:
+- "answer_markdown": focused, opinionated response (200-400 words)
+- "recommended_grants": list of 2-3 most relevant grants (not 5+) with:
     - grant_id
     - title
     - source
-    - reason (2-3 sentences explaining relevance and fit)
+    - reason (1-2 sentences explaining why it's the right fit)
 """
 
 
@@ -983,7 +1129,7 @@ def _chat_retrieve(
     sources: Optional[List[str]],
 ) -> tuple:
     """
-    Retrieve relevant grants for chat using vector search.
+    Retrieve relevant grants for chat using hybrid RAG (Pinecone + PostgreSQL).
 
     Args:
         query_text: User's question/query
@@ -994,22 +1140,31 @@ def _chat_retrieve(
     Returns:
         Tuple of (hits, grants_by_id)
     """
-    # Use existing vector index
-    hits = vector_index.query(
-        query_text=query_text,
+    # Hybrid RAG: Step 1 - Search Pinecone
+    pinecone_results = vector_index.search(
+        query=query_text,
         top_k=top_k * 2,  # Over-fetch for filtering
-        filter_scope=None
+        status=None
     )
 
-    # Load and filter grants
-    grants_by_id = {}
+    if not pinecone_results:
+        return [], {}
 
-    for hit in hits:
-        gid = hit.grant_id
-        if not gid or gid in grants_by_id:
-            continue
+    # Hybrid RAG: Step 2 - Extract grant IDs
+    grant_ids = [r['grant_id'] for r in pinecone_results]
 
-        grant = grant_store.get_grant(gid)
+    # Hybrid RAG: Step 3 - Bulk fetch from PostgreSQL
+    grants_from_db = grant_store.get_grants_by_ids(grant_ids)
+    grants_by_id = {g.grant_id: g for g in grants_from_db}
+
+    # Hybrid RAG: Step 4 - Apply filters and convert to VectorHit objects
+    filtered_hits = []
+    filtered_grants_by_id = {}
+
+    for r in pinecone_results:
+        gid = r['grant_id']
+        grant = grants_by_id.get(gid)
+
         if not grant:
             continue
 
@@ -1020,16 +1175,19 @@ def _chat_retrieve(
         if sources and grant.source not in sources:
             continue
 
-        grants_by_id[gid] = grant
+        filtered_grants_by_id[gid] = grant
+        filtered_hits.append(VectorHit(
+            grant_id=gid,
+            score=r['score'],
+            metadata=r['metadata'],
+            grant=grant
+        ))
 
         # Stop when we have enough
-        if len(grants_by_id) >= top_k:
+        if len(filtered_grants_by_id) >= top_k:
             break
 
-    # Filter hits to only those with valid grants
-    filtered_hits = [h for h in hits if h.grant_id in grants_by_id]
-
-    return filtered_hits, grants_by_id
+    return filtered_hits, filtered_grants_by_id
 
 
 def group_results_by_grant(hits: list, max_grants: int = 5) -> list:
@@ -1822,20 +1980,103 @@ def expand_query_for_search(query: str) -> str:
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """
-    Health check endpoint.
+    Health check endpoint - verify hybrid RAG system (PostgreSQL + Pinecone).
+
+    Checks:
+    - PostgreSQL connection and grant count
+    - Pinecone connection and vector count
+    - Data synchronization (counts should roughly match)
 
     Returns:
-        System health status
+        Detailed system health status with connection info and sync status
     """
-    # Count documents as a proxy for index size
-    # In production, get this from vector index stats
-    vector_size = len(vector_index._vectors) if hasattr(vector_index, '_vectors') else 0
+    from datetime import datetime
 
-    return HealthResponse(
-        status="healthy",
-        database=DB_PATH,
-        vector_index_size=vector_size,
-    )
+    try:
+        # Check PostgreSQL connection and grant count
+        postgres_grants = grant_store.count_grants()
+        postgres_connected = True
+        logger.info(f"PostgreSQL: {postgres_grants} grants")
+
+        # Check Pinecone connection and vector count
+        pinecone_stats = vector_index.get_index_stats()
+        pinecone_vectors = pinecone_stats.get("total_vectors", 0)
+        pinecone_dimension = pinecone_stats.get("dimension", 0)
+        pinecone_connected = True
+        logger.info(f"Pinecone: {pinecone_vectors} vectors (dimension: {pinecone_dimension})")
+
+        # Verify data presence and system health
+        # Note: Pinecone vectors > PostgreSQL grants is normal (multiple embeddings per grant)
+        # We expect roughly 20-30 vectors per grant (document chunks)
+        avg_vectors_per_grant = pinecone_vectors / postgres_grants if postgres_grants > 0 else 0
+
+        # Health criteria:
+        # - Both systems have data (postgres_grants > 0 and pinecone_vectors > 0)
+        # - Reasonable ratio (at least 1 vector per grant, max ~100 vectors per grant)
+        has_data = postgres_grants > 0 and pinecone_vectors > 0
+        ratio_ok = 1 <= avg_vectors_per_grant <= 100 if postgres_grants > 0 else False
+
+        # Determine overall health status
+        if has_data and ratio_ok:
+            status = "healthy"
+        elif postgres_connected and pinecone_connected and has_data:
+            status = "warning"  # Connected but unusual ratio
+        else:
+            status = "unhealthy"
+
+        return {
+            "status": status,
+            "postgres_grants": postgres_grants,
+            "pinecone_vectors": pinecone_vectors,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            # Additional details for debugging
+            "postgres": {
+                "connected": postgres_connected,
+                "grants": postgres_grants
+            },
+            "pinecone": {
+                "connected": pinecone_connected,
+                "vectors": pinecone_vectors,
+                "dimension": pinecone_dimension,
+                "index": "ailsa-grants"
+            },
+            "hybrid_rag": {
+                "enabled": True,
+                "has_data": has_data,
+                "ratio_ok": ratio_ok,
+                "avg_vectors_per_grant": round(avg_vectors_per_grant, 1)
+            }
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+        # Return detailed error info instead of raising HTTPException
+        # This makes debugging easier
+        return {
+            "status": "unhealthy",
+            "postgres_grants": 0,
+            "pinecone_vectors": 0,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "error": str(e),
+            "postgres": {
+                "connected": False,
+                "grants": 0
+            },
+            "pinecone": {
+                "connected": False,
+                "vectors": 0,
+                "dimension": 0,
+                "index": "ailsa-grants"
+            },
+            "hybrid_rag": {
+                "enabled": False,
+                "has_data": False,
+                "ratio_ok": False,
+                "avg_vectors_per_grant": 0
+            }
+        }
 
 
 @app.get("/grants", response_model=List[GrantSummary])
@@ -1878,21 +2119,11 @@ async def get_grant(grant_id: str):
     if not grant:
         raise HTTPException(status_code=404, detail=f"Grant not found: {grant_id}")
 
-    # Get associated documents
-    docs = doc_store.get_documents_for_grant(grant_id)
-
+    # Documents are now embedded in Pinecone metadata, not stored separately
+    # Return empty documents list for now
     return GrantWithDocuments(
         grant=_grant_to_detail(grant),
-        documents=[
-            DocumentSummary(
-                id=d.id,
-                doc_type=d.doc_type,
-                scope=d.scope,
-                source_url=d.source_url,
-                length=len(d.text),
-            )
-            for d in docs
-        ],
+        documents=[],
     )
 
 
@@ -1907,7 +2138,13 @@ async def search(
     filter_scope: Optional[str] = Query(None, description="Filter by scope: 'competition' or 'global'"),
 ):
     """
-    Perform semantic search over indexed documents with optional filters.
+    Hybrid RAG search: Pinecone (semantic) + PostgreSQL (details).
+
+    Architecture:
+    1. Generate embedding for query (OpenAI)
+    2. Search Pinecone for similar grant IDs
+    3. Fetch full grant details from PostgreSQL
+    4. Combine results with relevance scores
 
     Args:
         query: Natural language search query
@@ -1921,38 +2158,66 @@ async def search(
     Returns:
         Search results with relevance scores
     """
-    logger.info(f"Search query: {query} (top_k={top_k}, active_only={active_only}, scope={filter_scope})")
+    logger.info(f"Search query: {query} (top_k={top_k}, active_only={active_only})")
 
-    # Over-fetch to account for filtering
+    # Step 1: Search Pinecone for semantically similar grants
+    # Over-fetch to account for post-filtering
     fetch_k = min(top_k * 3, 150)
 
-    # Query vector index
-    hits = vector_index.query(
-        query_text=query,
+    pinecone_results = vector_index.search(
+        query=query,
         top_k=fetch_k,
-        filter_scope=filter_scope,
+        source=None,  # We'll filter in Python for more complex logic
+        status=None
     )
 
-    # Convert to API schema with filtering
+    if not pinecone_results:
+        logger.info("No Pinecone results found")
+        return SearchResponse(query=query, total_results=0, results=[])
+
+    # Step 2: Extract grant IDs and build score mapping
+    # Note: Pinecone stores document chunks with IDs like "nihr_123_chunk_1"
+    # The actual grant_id is in metadata['grant_id']
+    grant_ids = [r['metadata']['grant_id'] for r in pinecone_results if 'grant_id' in r.get('metadata', {})]
+
+    # Build score mapping - use highest score per grant if multiple chunks
+    scores_map = {}
+    for r in pinecone_results:
+        gid = r.get('metadata', {}).get('grant_id')
+        if gid and (gid not in scores_map or r['score'] > scores_map[gid]):
+            scores_map[gid] = r['score']
+
+    # Build metadata mapping
+    metadata_map = {}
+    for r in pinecone_results:
+        gid = r.get('metadata', {}).get('grant_id')
+        if gid:
+            metadata_map[gid] = r['metadata']
+
+    # Deduplicate grant IDs (same grant may have multiple chunks)
+    grant_ids = list(dict.fromkeys(grant_ids))
+
+    logger.info(f"Pinecone returned {len(grant_ids)} candidates")
+
+    # Step 3: Fetch full grant details from PostgreSQL (bulk operation)
+    grants = grant_store.get_grants_by_ids(grant_ids)
+    logger.info(f"PostgreSQL returned {len(grants)} grants")
+
+    # Step 4: Apply filters and combine with relevance scores
     results: List[SearchHit] = []
 
-    for hit in hits:
-        # Get grant details
-        grant = grant_store.get_grant(hit.grant_id) if hit.grant_id else None
+    for grant in grants:
+        grant_id = grant.id
 
-        if not grant:
-            continue
-
-        # Apply filters
+        # Apply active_only filter
         if active_only and not grant.is_active:
             continue
 
-        if min_funding is not None:
-            # Parse total_fund to get GBP amount
+        # Apply funding filters
+        if min_funding is not None or max_funding is not None:
             fund_amount = None
             if grant.total_fund:
                 # Extract numeric value from total_fund string
-                import re
                 match = re.search(r'[\d,]+', grant.total_fund)
                 if match:
                     try:
@@ -1960,49 +2225,39 @@ async def search(
                     except ValueError:
                         pass
 
-            if fund_amount is None or fund_amount < min_funding:
+            if min_funding is not None and (fund_amount is None or fund_amount < min_funding):
+                continue
+            if max_funding is not None and (fund_amount is not None and fund_amount > max_funding):
                 continue
 
-        if max_funding is not None:
-            # Parse total_fund to get GBP amount
-            fund_amount = None
-            if grant.total_fund:
-                import re
-                match = re.search(r'[\d,]+', grant.total_fund)
-                if match:
-                    try:
-                        fund_amount = int(match.group().replace(',', ''))
-                    except ValueError:
-                        pass
-
-            if fund_amount is not None and fund_amount > max_funding:
-                continue
-
+        # Apply source filter
         if sources:
             sources_lower = [s.lower() for s in sources]
             if grant.source.lower() not in sources_lower:
                 continue
 
-        # Try cached GPT summary first, fallback to chunk snippet
-        summary = None
-        if hit.grant_id:
-            summary = _get_grant_summary(hit.grant_id)
+        # Get relevance score from Pinecone
+        score = scores_map.get(grant_id, 0.0)
+        metadata = metadata_map.get(grant_id, {})
 
-        # Use summary if available, otherwise fallback to snippet
+        # Try cached GPT summary first, fallback to grant description
+        summary = _get_grant_summary(grant_id)
         if summary:
             snippet = summary
+        elif grant.description:
+            snippet = _build_snippet(grant.description)
         else:
-            snippet = _build_snippet(hit.text)
+            snippet = grant.title or "No description available"
 
         results.append(
             SearchHit(
-                grant_id=hit.grant_id or "unknown",
+                grant_id=grant_id,
                 title=grant.title,
                 source=grant.source,
-                score=round(hit.score, 4),
-                doc_type=hit.metadata.get("doc_type", "unknown"),
-                scope=hit.metadata.get("scope", "unknown"),
-                source_url=hit.source_url,
+                score=round(score, 4),
+                doc_type=metadata.get("doc_type", "grant"),
+                scope=metadata.get("scope", filter_scope or "unknown"),
+                source_url=grant.url or "",
                 snippet=snippet,
             )
         )
@@ -2011,7 +2266,10 @@ async def search(
         if len(results) >= top_k:
             break
 
-    logger.info(f"Search returned {len(results)} results (filtered from {len(hits)} candidates)")
+    # Step 5: Sort by relevance score (highest first)
+    results.sort(key=lambda x: x.score, reverse=True)
+
+    logger.info(f"Search '{query}' returned {len(results)} results (after filtering)")
 
     return SearchResponse(
         query=query,
@@ -2076,12 +2334,17 @@ async def search_explain(req: ExplainRequest):
             logger.error(f"✗ Unexpected error initializing GPT: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # Perform semantic search
+    # Hybrid RAG: Perform semantic search
     logger.info(f"Explain query: {req.query} (top_k={req.top_k})")
 
-    hits = vector_index.query(query_text=req.query, top_k=req.top_k * 2)  # Over-fetch
+    # Step 1: Search Pinecone
+    pinecone_results = vector_index.search(
+        query=req.query,
+        top_k=req.top_k * 2,  # Over-fetch
+        status=None
+    )
 
-    if not hits:
+    if not pinecone_results:
         logger.info("No relevant grants found")
         return ExplainResponse(
             query=req.query,
@@ -2089,30 +2352,47 @@ async def search_explain(req: ExplainRequest):
             referenced_grants=[],
         )
 
-    # Group by grant_id and keep best-scoring chunk per grant
+    # Step 2: Group by grant_id and keep best score per grant
     by_grant = {}
-    for hit in hits:
-        if not hit.grant_id:
+    for r in pinecone_results:
+        grant_id = r['grant_id']
+        if not grant_id:
             continue
-        current = by_grant.get(hit.grant_id)
-        if current is None or hit.score > current.score:
-            by_grant[hit.grant_id] = hit
+        current = by_grant.get(grant_id)
+        if current is None or r['score'] > current['score']:
+            by_grant[grant_id] = r
 
-    # Sort grants by score, take top N for LLM context
+    # Step 3: Sort grants by score, take top N for LLM context
     max_grants_for_llm = 5
-    sorted_hits = sorted(by_grant.values(), key=lambda h: h.score, reverse=True)
-    selected_hits = sorted_hits[:max_grants_for_llm]
+    sorted_results = sorted(by_grant.values(), key=lambda r: r['score'], reverse=True)
+    selected_results = sorted_results[:max_grants_for_llm]
 
-    # Build context from deduplicated grants
+    # Step 4: Bulk fetch grants from PostgreSQL
+    grant_ids = [r['grant_id'] for r in selected_results]
+    grants_from_db = grant_store.get_grants_by_ids(grant_ids)
+    grants_by_id = {g.grant_id: g for g in grants_from_db}
+
+    logger.info(f"Fetched {len(grants_from_db)} grants from PostgreSQL for explanation")
+
+    # Step 5: Build context from grants with VectorHit objects
     context_blocks: List[str] = []
     referenced_grants: List[ReferencedGrant] = []
 
-    for hit in selected_hits:
-        grant = grant_store.get_grant(hit.grant_id)
+    for r in selected_results:
+        grant_id = r['grant_id']
+        grant = grants_by_id.get(grant_id)
 
         if not grant:
-            logger.warning(f"Grant not found: {hit.grant_id}")
+            logger.warning(f"Grant not found in PostgreSQL: {grant_id}")
             continue
+
+        # Create VectorHit for compatibility
+        hit = VectorHit(
+            grant_id=grant_id,
+            score=r['score'],
+            metadata=r['metadata'],
+            grant=grant
+        )
 
         # Extract metadata
         doc_type = hit.metadata.get("doc_type", "unknown")
@@ -2382,12 +2662,12 @@ async def chat_with_grants(req: ChatRequest):
                 grants=[],
             )
 
-    # Get search hits
+    # Hybrid RAG: Step 1 - Search Pinecone for relevant grants
     try:
-        hits = vector_index.query(
-            query_text=query,
+        pinecone_results = vector_index.search(
+            query=query,
             top_k=20,
-            filter_scope=None
+            status=None  # Get all statuses, filter later if needed
         )
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
@@ -2395,6 +2675,35 @@ async def chat_with_grants(req: ChatRequest):
             answer="Search failed unexpectedly. Try rephrasing or asking again in a moment.",
             grants=[],
         )
+
+    if not pinecone_results:
+        return ChatResponse(
+            answer="I don't see anything in the current Innovate UK or NIHR data that clearly matches that. "
+                   "You might need a different funding body or a more general innovation grant.",
+            grants=[],
+        )
+
+    # Hybrid RAG: Step 2 - Extract grant IDs
+    grant_ids = [r['grant_id'] for r in pinecone_results]
+    logger.info(f"Pinecone returned {len(grant_ids)} grant IDs")
+
+    # Hybrid RAG: Step 3 - Fetch full grant details from PostgreSQL (bulk)
+    grants_from_db = grant_store.get_grants_by_ids(grant_ids)
+    grants_by_id = {g.grant_id: g for g in grants_from_db}
+    logger.info(f"PostgreSQL returned {len(grants_from_db)} grants")
+
+    # Hybrid RAG: Step 4 - Convert to VectorHit objects for compatibility
+    hits = []
+    for r in pinecone_results:
+        grant_id = r['grant_id']
+        grant = grants_by_id.get(grant_id)
+        if grant:
+            hits.append(VectorHit(
+                grant_id=grant_id,
+                score=r['score'],
+                metadata=r['metadata'],
+                grant=grant
+            ))
 
     if not hits:
         return ChatResponse(
@@ -2752,13 +3061,13 @@ Example: "Just checked out {company_info['title']} - {company_info.get('sector',
             # Step 4: Expand query for better vector search
             search_query = expand_query_for_search(resolved_query)
 
-            # Step 5: Perform vector search with expanded query
+            # Step 5: Hybrid RAG - Search Pinecone for relevant grants
             logger.info(f"Vector search query: '{search_query[:100]}...'")
             try:
-                hits = vector_index.query(
-                    query_text=search_query,
+                pinecone_results = vector_index.search(
+                    query=search_query,
                     top_k=20,
-                    filter_scope=None
+                    status=None  # Get all statuses
                 )
             except Exception as e:
                 logger.error(f"Vector search failed: {e}")
@@ -2766,27 +3075,47 @@ Example: "Just checked out {company_info['title']} - {company_info.get('sector',
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
-            logger.info(f"Vector search returned {len(hits)} hits")
-            if hits:
-                logger.info(f"Top 3 scores: {[f'{h.score:.3f}' for h in hits[:3]]}")
-                logger.info(f"Top hit: {hits[0].grant_id if hasattr(hits[0], 'grant_id') else 'unknown'}")
+            if not pinecone_results:
+                msg = "I don't see anything in the current Innovate UK or NIHR data that clearly matches that. You might need a different funding body or a more general innovation grant."
+                yield f"data: {json.dumps({'type': 'token', 'content': msg})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
 
-            # CRITICAL: Filter out Smart Grants (paused January 2025)
-            hits_before_filter = len(hits)
-            filtered_hits = []
-            for h in hits:
-                # Get grant details to check title
-                grant = grant_store.get_grant(h.grant_id) if h.grant_id else None
+            # Hybrid RAG: Extract grant IDs and fetch from PostgreSQL (bulk)
+            grant_ids = [r['grant_id'] for r in pinecone_results]
+            logger.info(f"Pinecone returned {len(grant_ids)} grant IDs")
+
+            grants_from_db = grant_store.get_grants_by_ids(grant_ids)
+            grants_by_id = {g.grant_id: g for g in grants_from_db}
+            logger.info(f"PostgreSQL returned {len(grants_from_db)} grants")
+
+            # Hybrid RAG: Convert to VectorHit objects and filter out Smart Grants
+            hits_before_filter = len(pinecone_results)
+            hits = []
+            for r in pinecone_results:
+                grant_id = r['grant_id']
+                grant = grants_by_id.get(grant_id)
                 if grant:
+                    # CRITICAL: Filter out Smart Grants (paused January 2025)
                     title_lower = grant.title.lower()
                     if "smart grant" in title_lower or "smart grants" in title_lower:
                         logger.info(f"🚫 Filtered out Smart Grant: {grant.title}")
                         continue
-                filtered_hits.append(h)
 
-            hits = filtered_hits
+                    hits.append(VectorHit(
+                        grant_id=grant_id,
+                        score=r['score'],
+                        metadata=r['metadata'],
+                        grant=grant
+                    ))
+
             if hits_before_filter != len(hits):
                 logger.info(f"Filtered out {hits_before_filter - len(hits)} Smart Grants, {len(hits)} hits remaining")
+
+            logger.info(f"Vector search returned {len(hits)} hits after filtering")
+            if hits:
+                logger.info(f"Top 3 scores: {[f'{h.score:.3f}' for h in hits[:3]]}")
+                logger.info(f"Top hit: {hits[0].grant_id}")
 
             if not hits:
                 msg = "I don't see anything in the current Innovate UK or NIHR data that clearly matches that. You might need a different funding body or a more general innovation grant."
@@ -2829,6 +3158,13 @@ Example: "Just checked out {company_info['title']} - {company_info.get('sector',
                 logger.error(f"Original hits: {len(hits)}")
                 if hits:
                     logger.error(f"Top hit was: grant_id={hits[0].grant_id if hasattr(hits[0], 'grant_id') else 'unknown'}, score={hits[0].score:.3f}")
+
+            # Add low-confidence warning if needed
+            low_confidence_warning = ""
+            if not grants:
+                low_confidence_warning = "\n⚠️ NO MATCHING GRANTS FOUND. Be honest that you don't have relevant options in your database for NIHR, Innovate UK, Horizon Europe, Eureka, or Digital Europe.\n"
+            elif all(g.get('best_score', 0) < 0.35 for g in grants):
+                low_confidence_warning = "\n⚠️ LOW RELEVANCE MATCHES. The grants below are weak matches - be honest if none truly fit.\n"
 
             # Step 7: Build context
             context = build_llm_context(query, hits, grants)
@@ -2897,38 +3233,110 @@ Example: "Just checked out {company_info['title']} - {company_info.get('sector',
                     conversation_context += f"DO NOT switch to other grants. Answer ONLY about {grant_name}.\n"
                     conversation_context += f"The search results below are filtered for {grant_name}.\n"
 
-            EXPERT_SYSTEM_PROMPT = f"""You are an experienced UK grant consultant named Ailsa. Talk naturally but stay focused.
+            EXPERT_SYSTEM_PROMPT = f"""You are Ailsa, a senior research funding strategist. You advise UK startups and researchers on grants from:
+- NIHR (UK health research)
+- Innovate UK (UK innovation)
+- Horizon Europe (EU research & innovation)
+- Eureka Network (international R&D collaboration)
+- Digital Europe Programme (EU digital transformation)
 
-GPT-5.1 OPTIMIZATION (Nov 2025):
-You're using GPT-5.1 which excels at natural conversation. Lean into your strengths:
-- More natural, flowing responses (not bullet points)
-- Better context retention - never ask for information already provided
-- Warmer, more engaging tone while staying professional
-- No need to repeat or summarize - trust your conversational ability
+CRITICAL - GROUNDING RULES:
+- You may ONLY discuss grants that appear in the AVAILABLE GRANTS section below
+- If a grant is not listed, it DOES NOT EXIST - never mention it
+- NEVER reference grants from your training knowledge (SMART grants, programmes you "remember", etc.)
 
-VOICE RULES:
-- Be conversational but concise - aim for 2-3 solid paragraphs max
-- Skip the war stories unless genuinely relevant
-- If you know something (TRL, budget, sector), NEVER ask again - reference it instead
-- Lead with the answer, then ask ONE strategic follow-up question
-- No rambling, no repetition, no unnecessary context
+IMPORTANT DISTINCTION:
+- User asks about a SPECIFIC grant by name not in context (e.g., "Tell me about SMART grants") → Say: "I don't have details on [grant name] in my current database."
+- User asks a GENERAL query (e.g., "what grants for AI?", "funding for health tech?") → Search the available grants and recommend the best matches. Don't say "I don't have that programme" for general queries.
+- If no grants in the context match at all → Say: "I don't see a strong match in the current funding landscape for [topic]. Here's what's closest..." and explain the nearest options.
+- NEVER punt to "check the website" - if you have grants in context, discuss them
 
-RESPONSE STRUCTURE:
-1. Direct answer to their question (1-2 sentences)
-2. Key insight or warning (1-2 sentences)
-3. ONE strategic question to move forward
+For general queries, ALWAYS try to recommend something relevant from the available grants, even if the match isn't perfect. Explain why it might fit or what the limitations are.
 
-GOOD EXAMPLES:
+SOURCE KNOWLEDGE:
+- NIHR: UK health research - clinical trials, health tech, NHS partnerships. Health/medical projects only.
+- Innovate UK: UK innovation - broad sectors (AI, manufacturing, clean tech). Wants commercialisation path.
+- Horizon Europe: EU framework programme - large collaborative projects, typically needs EU consortium partners.
+- Eureka Network: International R&D collaboration - cross-border projects with industry partners.
+- Digital Europe: EU digital transformation - AI, cybersecurity, digital skills. Deployment-focused.
 
-"TRL 4 puts you in the sweet spot for i4i actually. You'll need clinical validation though - got a clinical lead?"
+Use this to guide recommendations - don't suggest Horizon Europe if they can't build EU consortium, don't suggest NIHR for non-health projects.
 
-"Since you're at TRL 4 in materials, the ATI Programme is your best bet - £1.5M available. What's the application - aerospace or automotive?"
+CRITICAL - PARAGRAPH FORMATTING:
+You MUST separate paragraphs with a blank line (two newlines: \\n\\n).
+You MUST use **double asterisks** for bold on grant names and key figures.
 
-BAD EXAMPLES (Never do this):
+FORMATTING FOR READABILITY:
+- Use SHORT paragraphs (2-4 sentences max per paragraph)
+- Add a BLANK LINE between EVERY paragraph (this is critical for readability)
+- Use **bold** for grant names and key figures (e.g., **i4i Programme**, **£400k-£2M**)
+- Total response: 200-350 words (be concise)
+- Structure as 3-4 distinct paragraphs:
 
-"Oh that's interesting! TRL 4, I see. Well, I remember working with another company at TRL 4 and they had quite a journey..."
+  Paragraph 1: Your top recommendation and why it fits
+  Paragraph 2: Key details (timing, funding range, process)
+  Paragraph 3: Strategic considerations or alternatives
+  Paragraph 4: Next step or question (brief)
 
-"There are 3 relevant grants: 1. NIHR i4i Product Development Award... 2. Biomedical Catalyst... 3. Smart Grants..."
+STILL FORBIDDEN:
+- Numbered lists (1. 2. 3.)
+- Bullet points (- or •)
+- Headers or markdown headers (##)
+- Long dense paragraphs (5+ sentences)
+
+NEVER START YOUR RESPONSE WITH:
+- "Great question..."
+- "Thanks for sharing..."
+- "It sounds like you have..."
+- "That's really interesting..."
+- "It's great to hear..."
+- Any compliment or acknowledgment
+
+ALWAYS START YOUR RESPONSE WITH:
+- Your top recommendation by name (in **bold**)
+- A direct answer to their question
+- The single most important thing they need to know
+
+AILSA'S CHARACTERISTIC LANGUAGE (use these naturally in prose):
+- "This is a snug fit for..."
+- "I'd suggest going in boldly on..."
+- "The biggest go/no-go factor here is..."
+- "Get in early on this one"
+- "Nice tidy grant for..."
+- "Great foot in the door"
+- "Transform their needs into..."
+- "Position this as..."
+- "The framing will be key here"
+- "Food for thought:"
+- "They will not fund..."
+- "Success rates are around X%"
+- "Secure a letter of support by..."
+
+VOICE:
+- Be opinionated: "Here's what I'd do" not "You could consider"
+- Lead with your single best recommendation, then expand
+- When asked "which should I do?" - ANSWER IT. Pick one. Justify it.
+- Don't bounce questions back: "which do you prefer?" is a cop-out
+- Match urgency - if they mention competitors or runway, factor that in
+- Reference facts they've told you, don't re-ask
+
+LINKING TO GRANTS:
+- When you recommend a grant, include its URL as a markdown link
+- Format: **[Grant Name](URL)**
+- Example: "**[i4i Programme](https://www.nihr.ac.uk/funding/i4i)** is your best fit..."
+- Only link grants that have URLs in the AVAILABLE GRANTS context - never invent URLs
+- If a grant doesn't have a URL in context, just mention it by name in **bold** without a link
+- This makes it easy for users to apply directly
+
+EXAMPLE OF WELL-FORMATTED RESPONSE:
+
+"**i4i Programme** is your best move here. At TRL 5 with NHS clinical partnership already in place, you're exactly what they fund. The £400k-£600k ask fits comfortably within their typical **£400k-£2M** range, and clinical validation for CE marking is their sweet spot.
+
+The timeline reality: expect 6-9 months from application to funds in account. Get your application started now - the competition is fierce and rounds fill up. Your Manchester Royal Eye Hospital connection is a genuine asset; formalise that relationship with a subcontract, not just a letter of support.
+
+On the grant vs equity question - given your £180k runway and competitor pressure, here's the play: pursue both tracks. Submit to **i4i** AND continue Series A conversations. They're not mutually exclusive, and £400k of non-dilutive funding landing in 9 months strengthens your negotiating position either way.
+
+What's your current relationship with Manchester Royal Eye Hospital - informal discussions or something more concrete?"
 
 CONVERSATION MEMORY - CRITICAL:
 When facts are established, reference them, don't re-ask:
@@ -2972,27 +3380,44 @@ Knowledge Transfer Partnership (KTP):
 - Perfect for accessing university facilities/knowledge you don't have
 - Great way to de-risk R&D
 
-Smart Grants:
-- PAUSED as of January 2025, not accepting applications
-- If asked: "Smart Grants are on hold. Try Biomedical Catalyst or sector-specific competitions instead."
+WHAT YOU MUST NOT DO:
+- Invent grant names, deadlines, or funding amounts not in the AVAILABLE GRANTS section
+- Recommend programmes that are paused, closed, or not in the database
+- Give generic advice that could apply to anyone
+- List every possible option - curate ruthlessly
+- Use numbered lists or headers unless explicitly asked
+
+EXAMPLE OF BAD RESPONSE (never do this):
+"It sounds like you have a promising product! Here are some options:
+1. NIHR i4i - could be relevant for clinical validation
+2. Innovate UK competitions - worth checking their calendar
+3. Horizon Europe - if you have EU partners
+Which funding route aligns best with your strategic goals?"
+
+EXAMPLE OF GOOD RESPONSE (do this):
+"i4i is your best move here. At TRL 5 with an NHS clinical partnership already in place, you're exactly what they fund - the £400-600k ask fits comfortably and clinical validation for CE marking is their sweet spot. Your Manchester Royal Eye Hospital connection is gold; formalise it with a subcontract, not just a letter of support.
+
+The tension is timing. i4i rounds typically take 6-8 months from submission to funds in account, which creates pressure given your competitor situation. Here's the play worth considering: pursue Series A conversations AND submit to i4i. They're not mutually exclusive - £400k of non-dilutive funding landing in 9 months strengthens your position regardless of the equity route.
+
+One thing to flag: Horizon Europe has some larger health innovation calls, but you'd need an EU consortium partner. Do you have any European clinical or commercial relationships we could leverage, or is UK-only funding the priority right now?"
 
 CONVERSATIONAL EXAMPLES (how to actually sound):
 
 Query: "What grants for medical devices?"
 ✅ Good: "For medtech, i4i is your main play - but they want clinical evidence, not just a cool device. Got an NHS trust interested?"
-❌ Bad: "Medical device grants include: NIHR i4i Product Development Award, Biomedical Catalyst, Innovation Loans..."
+❌ Bad: "Medical device grants include: 1. NIHR i4i Product Development Award... 2. Biomedical Catalyst... 3. [grant not in database]"
 
 Query: "How much can I get?"
-✅ Good: "i4i typically goes up to £1M, sometimes £2M for really strong projects. What's your budget looking like?"
+✅ Good: "Based on what's available, i4i typically goes up to £1M for projects like yours. What's your budget looking like?"
 ❌ Bad: "Funding amounts vary by grant type. Please see the grant cards below for specific amounts."
 
 Query: "Should I apply for a loan or grant?"
-✅ Good: "Grants are free money but 10-20% success rates. Loans give you more control at 3.7% rates, but the Credit team will grill your financials. What's your runway?"
-❌ Bad: "Both options have merits. Grants provide non-repayable funding while loans offer flexibility with structured repayment."
+✅ Good: "Grants are free money but competitive. If you've got revenue, loans might work at 3.7% rates. What's your runway?"
+❌ Bad: "Both options have merits. Consider your financial position and strategic priorities."
 
-Query: "When's the deadline?"
-✅ Good: "i4i closes December 3rd - that's 22 days from now. Doable if you start this week, but it'll be tight."
-❌ Bad: "The deadline for the NIHR i4i Product Development Award Round 29 is December 3rd, 2024."
+Query: "Tell me about Smart Grants"
+✅ Good: "I don't have Smart Grants in my current database - they've been on hold. Let me look at what's actually open for you instead. What sector are you in?"
+❌ Bad: "Smart Grants are a well-known programme from Innovate UK offering £25k-£2M for innovation projects..." [NEVER do this - you're hallucinating]
 
 CRITICAL: Output PLAIN MARKDOWN only (NOT JSON!). This will be displayed directly to users as it streams.
 {conversation_context}
@@ -3099,10 +3524,6 @@ WHEN THEY WANT MORE:
 - "What about the other one?" = Switch focus to a different grant from your list
 - Be honest if you've shown the best: "Honestly, those are your top matches. The rest are pretty marginal for what you need."
 
-SMART GRANTS ARE PAUSED:
-- Don't recommend Smart Grants - they're paused as of January 2025
-- If someone asks about them: "Smart Grants are on hold right now. For similar funding, look at Biomedical Catalyst or sector-specific competitions instead."
-
 HOW TO ACTUALLY TALK:
 Instead of: "There are 3 relevant grants: 1. NIHR i4i Product Development..."
 Say: "For a medtech at your stage, I'd start with i4i - it's NIHR's main product development stream. Have you got clinical evidence yet? That's the big one they care about."
@@ -3119,7 +3540,13 @@ The grants shown below your response:
 Remember: You're chatting with a founder over coffee, not writing a grant database entry. Be helpful, direct, and real."""
 
             # Build enhanced user prompt with intent and follow-up guidance
-            user_content = f"USER QUERY: {query}\n"
+            user_content = ""
+
+            # Add low-confidence warning if set
+            if low_confidence_warning:
+                user_content += low_confidence_warning
+
+            user_content += f"USER QUERY: {query}\n"
             user_content += f"Query Intent: {query_intent}\n\n"
 
             # Add conversation context if available
@@ -3132,7 +3559,14 @@ Remember: You're chatting with a founder over coffee, not writing a grant databa
                 if recent_exchanges:
                     user_content += f"RECENT CONVERSATION:\n{recent_exchanges}\n\n"
 
-            user_content += f"RELEVANT GRANT CONTEXT:\n{context}\n\n"
+            # EXPLICIT GRANT LIST - Only discuss these grants
+            if grants:
+                grants_in_db = "\n".join([f"• {g['title']} ({g['source']})" for g in grants[:8]])
+            else:
+                grants_in_db = "(No matching grants found)"
+
+            user_content += f"AVAILABLE GRANTS (only discuss these):\n{grants_in_db}\n\n"
+            user_content += f"GRANT DETAILS:\n{context}\n\n"
 
             # Add SME knowledge if relevant
             expert_knowledge = search_expert_knowledge(query, limit=3)
@@ -3143,6 +3577,8 @@ Remember: You're chatting with a founder over coffee, not writing a grant databa
             if smart_followup:
                 user_content += f"💡 Consider ending with this follow-up: {smart_followup}\n\n"
 
+            # Reinforce grounding
+            user_content += "⚠️ CRITICAL: Only recommend grants from AVAILABLE GRANTS above. If none fit, say so directly.\n\n"
             user_content += "Respond naturally like you're their experienced advisor. Be conversational, direct, and helpful."
 
             messages = [
@@ -3298,7 +3734,7 @@ async def chat_enhanced_stream(req: ChatRequest):
 
             from backend.enhanced_search import EnhancedGrantSearch
             enhanced_search_instance = EnhancedGrantSearch(
-                db_path=DB_PATH,
+                grant_store=grant_store,
                 vector_index=vector_index
             )
             logger.info("✓ Initialized Enhanced Search with GPT-5.1 strategic advisor")
@@ -3337,14 +3773,21 @@ async def chat_enhanced_stream(req: ChatRequest):
 
             # Send grants
             if result["grants"]:
+                from datetime import date, datetime
+
                 grants_json = []
                 for g in result["grants"]:
+                    # Convert date fields to ISO format strings for JSON serialization
+                    closes_at = g.get("closes_at")
+                    if isinstance(closes_at, (date, datetime)):
+                        closes_at = closes_at.isoformat()
+
                     grants_json.append({
                         "grant_id": g["grant_id"],
                         "title": g["title"],
                         "source": g["source"],
                         "total_fund_gbp": g.get("total_fund_gbp"),
-                        "closes_at": g.get("closes_at"),
+                        "closes_at": closes_at,
                         "url": g.get("url", "#")
                     })
 
@@ -3377,26 +3820,22 @@ async def startup_event():
     logger.info("=" * 80)
     logger.info("Grant Discovery API - Starting")
     logger.info("=" * 80)
-    logger.info(f"Database: {DB_PATH}")
-    logger.info(f"Embeddings: text-embedding-3-small (OpenAI)")
-    logger.info(f"LLM: GPT-4o-mini via OpenAI (lazy init)")
+    logger.info("Database: PostgreSQL (via DATABASE_URL)")
+    logger.info("Vector Index: Pinecone (ailsa-grants)")
+    logger.info(f"Cache: SQLite ({DB_PATH})")
+    logger.info("Embeddings: text-embedding-3-small (OpenAI)")
+    logger.info("LLM: GPT-4o-mini via OpenAI (lazy init)")
     logger.info(f"Docs: http://localhost:8000/docs")
     logger.info("=" * 80)
 
-    # Load all grants and documents into vector index
+    # Verify connections to PostgreSQL and Pinecone
     try:
-        grants = grant_store.list_grants(limit=1000)
-        logger.info(f"Found {len(grants)} grants in database")
+        grant_count = grant_store.count_grants()
+        logger.info(f"PostgreSQL connected: {grant_count} grants")
 
-        total_docs = 0
-        for grant in grants:
-            docs = doc_store.get_documents_for_grant(grant.id)
-            if docs:
-                vector_index.index_documents(docs)
-                total_docs += len(docs)
-
-        logger.info(f"Loaded {total_docs} documents into vector index")
+        pinecone_stats = vector_index.get_index_stats()
+        logger.info(f"Pinecone connected: {pinecone_stats.get('total_vectors', 0)} vectors")
     except Exception as e:
-        logger.error(f"Error loading documents into vector index: {e}")
+        logger.error(f"Error connecting to data sources: {e}")
 
     logger.info("=" * 80)
