@@ -169,6 +169,13 @@ class EnhancedGrantSearch:
 
         logger.info(f"Grant name filter: '{query_name}' -> {len(matching_grants)} matches, {len(other_grants)} others")
 
+        # Diagnostic: Log matching grants
+        if matching_grants:
+            logger.info(f"=== MATCHING GRANTS FOR '{query_name}' ===")
+            for i, g in enumerate(matching_grants, 1):
+                logger.info(f"  {i}. [{g.get('grant_id', 'N/A')}] {g.get('title', 'N/A')[:80]}")
+            logger.info(f"=== END MATCHING GRANTS ===")
+
         # If we found matches, prioritize them
         if matching_grants:
             # Return ALL matching grants (e.g., both Biomedical Catalyst variants)
@@ -266,6 +273,16 @@ class EnhancedGrantSearch:
             # Do full semantic search
             grants = self._semantic_search(query, top_k=top_k * 2, active_only=active_only)  # Get more for filtering
 
+        # Diagnostic: Log all grants after semantic search (before any filtering)
+        logger.info(f"=== GRANTS AFTER SEMANTIC SEARCH (before any filtering) ===")
+        logger.info(f"Total grants from semantic search: {len(grants)}")
+        for i, g in enumerate(grants[:20], 1):  # Show top 20
+            title = g.get('title', 'N/A')
+            grant_id = g.get('grant_id', 'N/A')
+            score = g.get('pinecone_score', 0)
+            logger.info(f"  {i}. [{grant_id}] (score: {score:.3f}) {title[:80]}")
+        logger.info(f"=== END SEMANTIC SEARCH RESULTS ===")
+
         logger.info(f"Grants before name filtering: {len(grants)}")
 
         # 4.5. Check if user is asking about a specific grant by name
@@ -289,6 +306,15 @@ class EnhancedGrantSearch:
         # 5. Filter by eligibility
         grant_ids = [g["grant_id"] for g in grants]
         filtered_ids = self.eligibility_filter.filter_grants(grant_ids, updated_profile)
+
+        # Diagnostic: Log which grants were filtered out
+        filtered_out = [g for g in grants if g["grant_id"] not in filtered_ids]
+        if filtered_out:
+            logger.info(f"=== GRANTS FILTERED OUT BY ELIGIBILITY ({len(filtered_out)} removed) ===")
+            for g in filtered_out[:10]:  # Show first 10
+                logger.info(f"  Removed: [{g.get('grant_id', 'N/A')}] {g.get('title', 'N/A')[:80]}")
+            logger.info(f"=== END FILTERED OUT GRANTS ===")
+
         grants = [g for g in grants if g["grant_id"] in filtered_ids]
 
         logger.info(f"Grants after eligibility filter: {len(grants)}")
