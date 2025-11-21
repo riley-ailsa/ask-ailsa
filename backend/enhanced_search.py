@@ -36,6 +36,36 @@ class EnhancedGrantSearch:
         self.strategic_advisor = StrategicAdvisor()
         self.profile_extractor = ProfileExtractor()
 
+    def _should_skip_grant_retrieval(self, query: str) -> bool:
+        """
+        Determine if this is a pure definition/knowledge query that doesn't need grants.
+
+        Examples:
+        - "what does TRL mean?" -> True (definition only)
+        - "what is TRL for biomedical catalyst?" -> False (needs grant info)
+        - "explain readiness levels" -> True (pure knowledge)
+        - "what grants fund TRL 5-7?" -> False (needs grants)
+        """
+        query_lower = query.lower().strip()
+
+        # Definition patterns - queries asking for explanations of concepts
+        definition_patterns = [
+            r"^what (is|does|are|means?) (?!grants?|funding|available)",  # "what is TRL" but not "what grants..."
+            r"^(define|explain|describe) (?!grants?|funding)",
+            r"^what's the (definition|meaning) of",
+            r"mean\?$",  # Ends with "mean?" like "what does TRL mean?"
+        ]
+
+        # Skip retrieval if it matches a definition pattern
+        for pattern in definition_patterns:
+            if re.search(pattern, query_lower):
+                # Additional check: Make sure query doesn't mention grants/funding
+                if not any(keyword in query_lower for keyword in ['grant', 'grants', 'funding', 'fund', 'available', 'apply']):
+                    logger.info(f"Definition query detected (pattern: '{pattern}') - skipping grant retrieval")
+                    return True
+
+        return False
+
     def _is_likely_followup(self, query: str, context: Dict) -> bool:
         """
         Pattern-based detection for follow-up questions.
@@ -220,27 +250,48 @@ class EnhancedGrantSearch:
         )
         self.conv_manager.extract_user_profile(session_id, updated_profile)
 
-        # 3. Classify intent
+        # 3. Check if this is a pure definition query (skip grant retrieval)
+        if self._should_skip_grant_retrieval(query):
+            logger.info("Definition query detected - answering from knowledge base only")
+            response = self.strategic_advisor.generate_advice(
+                query=query,
+                grants=[],  # No grants needed for definitions
+                user_profile=updated_profile,
+                context=context
+            )
+
+            # Store this interaction
+            self.conv_manager.add_message(session_id, "user", query)
+            self.conv_manager.add_message(session_id, "assistant", response)
+
+            return {
+                "response": response,
+                "grants": [],
+                "intent": "definition",
+                "user_profile": updated_profile
+            }
+
+        # 4. Classify intent
         intent_info = self.intent_classifier.classify(query, context)
         intent = intent_info["intent"]
 
         logger.info(f"Query intent: {intent}, confidence: {intent_info.get('confidence', 0)}")
 
-        # 3.5. Fallback: Pattern-based follow-up detection
+        # 4.5. Fallback: Pattern-based follow-up detection
         # If classifier missed it but query looks like a follow-up, override
         if intent != "followup" and self._is_likely_followup(query, context):
             logger.info(f"Pattern-based override: changing intent from '{intent}' to 'followup'")
             intent = "followup"
             intent_info["intent"] = "followup"
 
-        # 3.6. Check for "tell me more" pattern - always a follow-up if grants were discussed
+        # 4.6. Check for "tell me more" pattern - always a follow-up if grants were discussed
         if "tell me more" in query.lower() and context.get("discussed_grants"):
             if intent != "followup":
                 logger.info(f"'Tell me more' detected with discussed grants - overriding intent from '{intent}' to 'followup'")
                 intent = "followup"
                 intent_info["intent"] = "followup"
 
-        # 4. Get relevant grants based on intent
+        # 5. Get relevant grants based on intent
         if intent == "comparative" and intent_info.get("referenced_grants"):
             # User is comparing specific grants from conversation
             grant_ids = self._get_specific_grants(intent_info["referenced_grants"])
