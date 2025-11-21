@@ -165,8 +165,9 @@ class LLMClient:
                         Note: GPT-5.1 only supports temperature=1 (default)
                         This param is used for GPT-4o-mini fallback
             max_tokens: Maximum tokens in response
-            reasoning_effort: For GPT-5.1 - "none", "low", "medium", "high"
-                            Defaults to "none" for simple queries, omitted for complex
+            reasoning_effort: For GPT-5.1 - "low", "medium", "high"
+                            Note: GPT-5.1 does NOT support "none"
+                            Omit this parameter for simple queries to use model defaults
             model_override: Override automatic model selection
 
         Returns:
@@ -192,24 +193,25 @@ class LLMClient:
         }
 
         # Add model-specific parameters
-        if selected_model.startswith("gpt-5.1"):
-            # GPT-5.1: Uses max_completion_tokens and reasoning_effort
-            # Note: GPT-5.1 only supports temperature=1 (default), don't set it
+        if selected_model.startswith("gpt-5.1") or selected_model.startswith("gpt-5"):
+            # GPT-5/5.1: Only supports temperature=1 (default), don't set it
+            # GPT-5/5.1 requires max_completion_tokens, not max_tokens
             params["max_completion_tokens"] = max_tokens
 
-            # Add reasoning effort control
-            if reasoning_effort is not None:
-                params["reasoning_effort"] = reasoning_effort
-            elif user_query:
-                # Auto-set reasoning_effort based on complexity
-                complexity = self.analyze_query_complexity(user_query)
-                if complexity == QueryComplexity.SIMPLE:
-                    params["reasoning_effort"] = "none"  # Fast mode
-                # For moderate/complex, omit reasoning_effort to use adaptive default
-
-        elif selected_model.startswith("gpt-5"):
-            # GPT-5 (non-5.1) only supports temperature=1 and max_completion_tokens
-            params["max_completion_tokens"] = max_tokens
+            # Add reasoning effort control for GPT-5.1
+            if selected_model.startswith("gpt-5.1"):
+                if reasoning_effort is not None:
+                    # Only pass valid values: "low", "medium", "high"
+                    # GPT-5.1 does NOT support "none"
+                    if reasoning_effort in ("low", "medium", "high"):
+                        params["reasoning_effort"] = reasoning_effort
+                elif user_query:
+                    # Auto-set reasoning_effort based on complexity
+                    complexity = self.analyze_query_complexity(user_query)
+                    # For complex queries, enable deeper reasoning
+                    if complexity == QueryComplexity.COMPLEX:
+                        params["reasoning_effort"] = "medium"
+                    # For simple/moderate queries, omit reasoning_effort to use model defaults
         else:
             # GPT-4o-mini and older models support temperature
             params["temperature"] = temperature
@@ -247,11 +249,13 @@ class LLMClient:
             logger.error(f"API call failed with {selected_model}: {e}")
 
             # Fallback to GPT-4o-mini if GPT-5.1 fails
-            if "5.1" in selected_model:
+            if "5.1" in selected_model or "5" in selected_model:
                 logger.info("Falling back to GPT-4o-mini")
                 params["model"] = ModelType.GPT_4O_MINI.value
                 params.pop("reasoning_effort", None)
-                params["max_tokens"] = params.pop("max_completion_tokens", max_tokens)
+                # GPT-4o-mini uses max_tokens, not max_completion_tokens
+                if "max_completion_tokens" in params:
+                    params["max_tokens"] = params.pop("max_completion_tokens")
                 params["temperature"] = temperature
 
                 try:
@@ -280,7 +284,7 @@ class LLMClient:
             messages: List of message dicts with "role" and "content"
             temperature: Sampling temperature (0.0-2.0)
             max_tokens: Maximum tokens in response
-            reasoning_effort: For GPT-5.1 - "none", "low", "medium", "high"
+            reasoning_effort: For GPT-5.1 - "low", "medium", "high" (NOT "none")
             model_override: Override automatic model selection
 
         Yields:
@@ -307,19 +311,22 @@ class LLMClient:
         }
 
         # Add model-specific parameters
-        if selected_model.startswith("gpt-5.1"):
-            # GPT-5.1 only supports temperature=1 (default), don't set it
+        if selected_model.startswith("gpt-5.1") or selected_model.startswith("gpt-5"):
+            # GPT-5/5.1: Only supports temperature=1 (default), don't set it
+            # GPT-5/5.1 requires max_completion_tokens, not max_tokens
             params["max_completion_tokens"] = max_tokens
 
-            if reasoning_effort is not None:
-                params["reasoning_effort"] = reasoning_effort
-            elif user_query:
-                complexity = self.analyze_query_complexity(user_query)
-                if complexity == QueryComplexity.SIMPLE:
-                    params["reasoning_effort"] = "none"
-
-        elif selected_model.startswith("gpt-5"):
-            params["max_completion_tokens"] = max_tokens
+            # Add reasoning effort control for GPT-5.1
+            if selected_model.startswith("gpt-5.1"):
+                if reasoning_effort is not None:
+                    # Only pass valid values: "low", "medium", "high"
+                    if reasoning_effort in ("low", "medium", "high"):
+                        params["reasoning_effort"] = reasoning_effort
+                elif user_query:
+                    complexity = self.analyze_query_complexity(user_query)
+                    # Only set reasoning_effort for complex queries
+                    if complexity == QueryComplexity.COMPLEX:
+                        params["reasoning_effort"] = "medium"
         else:
             params["temperature"] = temperature
             params["max_tokens"] = max_tokens
@@ -336,11 +343,13 @@ class LLMClient:
             logger.error(f"Streaming failed with {selected_model}: {e}")
 
             # Fallback to GPT-4o-mini
-            if "5.1" in selected_model:
+            if "5.1" in selected_model or "5" in selected_model:
                 logger.info("Stream fallback to GPT-4o-mini")
                 params["model"] = ModelType.GPT_4O_MINI.value
                 params.pop("reasoning_effort", None)
-                params["max_tokens"] = params.pop("max_completion_tokens", max_tokens)
+                # GPT-4o-mini uses max_tokens, not max_completion_tokens
+                if "max_completion_tokens" in params:
+                    params["max_tokens"] = params.pop("max_completion_tokens")
                 params["temperature"] = temperature
 
                 try:

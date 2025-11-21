@@ -247,16 +247,32 @@ class EnhancedGrantSearch:
 
         logger.info(f"Grants after eligibility filter: {len(grants)}")
 
-        # 6. Rank by fit
-        if grants:
+        # 6. Rank by fit (boost Pinecone scores rather than replace them)
+        if grants and updated_profile:
+            # Get eligibility fit scores
             ranked = self.eligibility_filter.rank_by_fit(
                 [g["grant_id"] for g in grants],
                 updated_profile
             )
+            id_to_fit_score = dict(ranked)
 
-            # Reorder grants by ranking
-            id_to_score = dict(ranked)
-            grants.sort(key=lambda g: id_to_score.get(g["grant_id"], 0), reverse=True)
+            # Combine Pinecone semantic score with eligibility boost
+            # This preserves semantic ranking while allowing profile matching to influence order
+            for grant in grants:
+                pinecone_score = grant.get('pinecone_score', 0.5)  # Semantic relevance (0-1)
+                fit_score = id_to_fit_score.get(grant["grant_id"], 0.5)  # Eligibility fit (0-1)
+
+                # Combined score: 70% semantic + 30% eligibility
+                # This weights semantic relevance higher to preserve Pinecone ranking
+                grant['combined_score'] = (pinecone_score * 0.7) + (fit_score * 0.3)
+
+            # Sort by combined score
+            grants.sort(key=lambda g: g.get('combined_score', 0), reverse=True)
+
+            logger.info(f"Ranking: Combined semantic ({pinecone_score:.3f} × 0.7) + eligibility ({fit_score:.3f} × 0.3)")
+        elif grants:
+            # If no profile, just preserve Pinecone ranking
+            grants.sort(key=lambda g: g.get('pinecone_score', 0), reverse=True)
 
         # Determine how many grants to send to LLM
         # If user asked about a specific grant, send more to include all variants
@@ -322,11 +338,45 @@ class EnhancedGrantSearch:
         }
 
     def _get_specific_grants(self, grant_names: List[str]) -> List[str]:
-        """Get grant IDs from grant names/titles."""
-        # For now, return empty list - this would need a proper Postgres search implementation
-        # or use vector search to find grants by name
-        logger.warning("_get_specific_grants not fully implemented for Postgres yet")
-        return []
+        """
+        Get grant IDs from grant names/titles.
+
+        Searches PostgreSQL for grants matching the given names.
+
+        Args:
+            grant_names: List of grant names or partial titles to search
+
+        Returns:
+            List of matching grant IDs
+        """
+        if not grant_names:
+            return []
+
+        grant_ids = []
+
+        try:
+            for name in grant_names:
+                # Use PostgresGrantStore to search by title
+                # The store has a get_grant method but we need to search by title
+                # Let's use vector search as a fallback since it's semantic
+                if self.vector_index:
+                    logger.info(f"Searching for grants matching: '{name}'")
+                    results = self.vector_index.search(name, top_k=5)
+                    for result in results:
+                        gid = result.get('grant_id')
+                        # Check if title actually contains the search term
+                        title = result.get('metadata', {}).get('title', '')
+                        if gid and name.lower() in title.lower():
+                            if gid not in grant_ids:
+                                grant_ids.append(gid)
+                                logger.info(f"  Found: {gid} - {title[:60]}")
+
+            logger.info(f"Found {len(grant_ids)} grants by name")
+            return grant_ids[:10]  # Limit to 10 results
+
+        except Exception as e:
+            logger.error(f"Error in _get_specific_grants: {e}")
+            return []
 
     def _fetch_grants_by_ids(self, grant_ids: List[str], active_only: bool = True) -> List[Dict]:
         """Fetch full grant details by IDs."""
@@ -381,7 +431,26 @@ class EnhancedGrantSearch:
             if len(grant_ids_raw) != len(grant_ids_unique):
                 logger.info(f"  Deduplication removed {len(grant_ids_raw) - len(grant_ids_unique)} duplicate grant_ids")
 
-            return self._fetch_grants_by_ids(grant_ids_unique, active_only)
+            # Build score map to preserve Pinecone ranking
+            score_map = {}
+            for result in results:
+                gid = result.get('grant_id')
+                score = result.get('score', 0)
+                # Keep best score for each grant (in case of duplicates from chunks)
+                if gid not in score_map or score > score_map[gid]:
+                    score_map[gid] = score
+
+            # Fetch grants from Postgres
+            grants = self._fetch_grants_by_ids(grant_ids_unique, active_only)
+
+            # Attach Pinecone scores to grants for later use
+            for grant in grants:
+                grant['pinecone_score'] = score_map.get(grant['grant_id'], 0)
+
+            # Sort by Pinecone score to preserve semantic ranking
+            grants.sort(key=lambda g: g.get('pinecone_score', 0), reverse=True)
+
+            return grants
 
         except Exception as e:
             logger.error(f"Semantic search failed: {e}")
