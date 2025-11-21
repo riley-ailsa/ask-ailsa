@@ -97,6 +97,34 @@ class EnhancedGrantSearch:
 
         return False
 
+    def _extract_grants_from_history(self, history: List[Dict]) -> List[str]:
+        """
+        Extract grant IDs mentioned in recent assistant messages.
+
+        Parses the conversation history to find grants that were discussed,
+        so follow-up queries can reference them without re-searching.
+
+        This is a fallback for when ConversationManager doesn't have tracked grants
+        (e.g., when using streaming endpoints that bypass tracking).
+        """
+        grant_ids = []
+
+        # Look through recent assistant messages (last 3)
+        assistant_messages = [
+            msg for msg in history
+            if msg.get('role') == 'assistant' and len(msg.get('content', '')) > 100
+        ][-3:]
+
+        for msg in assistant_messages:
+            content = msg.get('content', '')
+            # Extract grant IDs like "innovate_uk_2332" or "nihr_2025_340"
+            id_pattern = r'\b(innovate_uk_\d+|nihr_\d+(?:_\d+)?|horizon_europe[:\w]+)\b'
+            found_ids = re.findall(id_pattern, content, re.IGNORECASE)
+            grant_ids.extend(found_ids)
+
+        # Remove duplicates while preserving order
+        return list(dict.fromkeys(grant_ids))[:10]
+
     def _extract_grant_name_query(self, query: str) -> Optional[str]:
         """
         Detect if user is asking about a specific grant by name.
@@ -154,9 +182,17 @@ class EnhancedGrantSearch:
         return grants[:top_k]
 
     def search(self, query: str, session_id: str, top_k: int = 10,
-               active_only: bool = True) -> Dict:
+               active_only: bool = True, history: Optional[List[Dict]] = None) -> Dict:
         """
         Enhanced search with context awareness and strategic advice.
+
+        Args:
+            query: User's search query
+            session_id: Conversation session ID
+            top_k: Number of grants to return
+            active_only: Filter to only active grants
+            history: Optional conversation history for extracting grant context
+                    (fallback when ConversationManager doesn't have tracked grants)
 
         Returns:
             {
@@ -208,7 +244,17 @@ class EnhancedGrantSearch:
             last_grant_ids = self.conv_manager.get_last_grants(session_id, n=5)
             grants = self._fetch_grants_by_ids(last_grant_ids, active_only)
 
-            logger.info(f"Follow-up query detected, using {len(grants)} grants from conversation history")
+            logger.info(f"Follow-up query detected, using {len(grants)} grants from ConversationManager")
+
+            # Fallback: Extract from conversation history if ConversationManager has no grants
+            # This handles streaming endpoints that bypass grant tracking
+            if len(grants) == 0 and history:
+                logger.info("ConversationManager has no grants, extracting from conversation history")
+                history_grant_ids = self._extract_grants_from_history(history)
+                if history_grant_ids:
+                    logger.info(f"Extracted {len(history_grant_ids)} grant IDs from history: {history_grant_ids}")
+                    grants = self._fetch_grants_by_ids(history_grant_ids, active_only)
+                    logger.info(f"Found {len(grants)} grants from history extraction")
 
             # Only add additional grants if we don't have enough context
             if len(grants) < 3 and self.vector_index:

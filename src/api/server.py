@@ -3753,12 +3753,22 @@ async def chat_enhanced_stream(req: ChatRequest):
 
     async def generate():
         try:
-            # Run enhanced search
+            # Convert ChatTurn history to dict format for enhanced_search
+            history_dicts = []
+            if hasattr(req, 'history') and req.history:
+                for turn in req.history:
+                    history_dicts.append({
+                        'role': turn.role,
+                        'content': turn.content
+                    })
+
+            # Run enhanced search with conversation history
             result = enhanced_search_instance.search(
                 query=query,
                 session_id=session_id,
                 top_k=10,
-                active_only=req.active_only if hasattr(req, 'active_only') else True
+                active_only=req.active_only if hasattr(req, 'active_only') else True,
+                history=history_dicts if history_dicts else None
             )
 
             # Stream the response text
