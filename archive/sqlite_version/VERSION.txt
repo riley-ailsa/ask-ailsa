@@ -1,0 +1,19 @@
+SQLite Implementation - Legacy Version
+======================================
+
+Version: 1.0 (Deprecated)
+Date Archived: November 20, 2025
+Status: ARCHIVED - Do Not Use
+
+Last Known State:
+- Grants: ~4,500
+- Sources: Horizon Europe, Digital Europe, NIHR, Innovate UK
+- Database: SQLite (local file)
+- Vector Search: SQLite-based
+
+Replaced By:
+- PostgreSQL on AWS RDS
+- Pinecone cloud vector search
+- Version 2.0 (Production)
+
+Git Tag: v1.0-sqlite-legacy

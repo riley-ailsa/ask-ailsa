@@ -113,11 +113,16 @@ class ExplainResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     """
-    Health check response.
+    Health check response with hybrid RAG system status.
     """
     status: str
-    database: str
-    vector_index_size: int
+    postgres_grants: int
+    pinecone_vectors: int
+    timestamp: str
+    postgres: Optional[Dict[str, Any]] = None
+    pinecone: Optional[Dict[str, Any]] = None
+    hybrid_rag: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 class ChatTurn(BaseModel):

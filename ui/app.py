@@ -124,6 +124,27 @@ st.markdown(
             color: #e2e8f0 !important;
         }
 
+        /* CRITICAL: Ensure paragraph spacing for readability */
+        .stChatMessage p {
+            line-height: 1.6 !important;
+        }
+
+        /* Preserve whitespace and line breaks */
+        .stMarkdown {
+            white-space: pre-wrap !important;
+        }
+
+        /* Only add spacing for assistant messages with multiple paragraphs */
+        /* Target messages that have actual content length */
+        div[data-testid="stChatMessageContent"] > div > p:not(:last-child) {
+            margin-bottom: 1rem !important;
+        }
+
+        /* Don't affect short single-paragraph messages */
+        div[data-testid="stChatMessageContent"] > div > p:only-child {
+            margin-bottom: 0 !important;
+        }
+
         hr {
             margin: 1.5rem 0 !important;
             border-color: rgba(148, 163, 184, 0.2) !important;
@@ -222,6 +243,45 @@ def ask_ailsa_stream(user_prompt: str) -> Iterable[Dict]:
         yield {"type": "error", "error": f"Unexpected error: {str(e)}"}
 
 
+def format_response_with_breaks(text: str) -> str:
+    """
+    Add paragraph breaks for readability, but only for longer responses.
+    Short messages (welcome, simple answers) are left unmodified.
+    Also ensures markdown links open in new tabs.
+    """
+    import re
+
+    # Don't modify short messages (less than 200 chars or single paragraph)
+    if len(text) < 200 or '\n\n' not in text:
+        # Still process links even for short messages
+        return _process_markdown_links(text)
+
+    # For longer responses, ensure paragraph breaks render
+    # Replace double newlines with space + HTML break for guaranteed rendering
+    formatted = text.replace('\n\n', '\n\n&nbsp;\n\n')
+
+    # Process markdown links to open in new tabs
+    return _process_markdown_links(formatted)
+
+
+def _process_markdown_links(text: str) -> str:
+    """
+    Convert markdown links to HTML with target="_blank" for new tab opening.
+    Preserves bold markdown around links: **[text](url)** -> <strong><a>text</a></strong>
+    """
+    import re
+
+    # Pattern: **[text](url)** (bold link)
+    pattern_bold = r'\*\*\[([^\]]+)\]\(([^\)]+)\)\*\*'
+    text = re.sub(pattern_bold, r'<strong><a href="\2" target="_blank" rel="noopener noreferrer">\1</a></strong>', text)
+
+    # Pattern: [text](url) (regular link)
+    pattern_regular = r'\[([^\]]+)\]\(([^\)]+)\)'
+    text = re.sub(pattern_regular, r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>', text)
+
+    return text
+
+
 def render_grant_card(grant: Dict):
     """Render a single grant card with proper styling."""
     title = grant.get("title", "Untitled Grant")
@@ -309,7 +369,7 @@ def handle_user_message(user_text: str):
 
             # Render final formatted version
             if full_response and not error_occurred:
-                st.markdown(full_response)
+                st.markdown(format_response_with_breaks(full_response), unsafe_allow_html=True)
             elif not full_response and not error_occurred:
                 st.markdown("_No response received from the backend._")
 
@@ -434,7 +494,11 @@ st.markdown("---")
 # Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        # Apply formatting to assistant messages
+        if msg["role"] == "assistant":
+            st.markdown(format_response_with_breaks(msg["content"]), unsafe_allow_html=True)
+        else:
+            st.markdown(msg["content"])
 
         # Render grants if this message has them
         if msg.get("grants"):

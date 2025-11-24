@@ -1,0 +1,14 @@
+╔════════════════════════════════════════════════════════════╗
+║                                                            ║
+║                    ⚠️  DEPRECATED CODE  ⚠️                   ║
+║                                                            ║
+║  This SQLite implementation is NO LONGER MAINTAINED        ║
+║                                                            ║
+║  Use PostgreSQL + Pinecone in main codebase instead       ║
+║                                                            ║
+║  Location: /src/storage/postgres_store.py                  ║
+║            /src/storage/pinecone_index.py                  ║
+║                                                            ║
+║  Archived: November 20, 2025                              ║
+║                                                            ║
+╚════════════════════════════════════════════════════════════╝

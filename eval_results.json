@@ -1,0 +1,126 @@
+{
+  "timestamp": "2025-11-21T11:26:06.549225",
+  "eval_file": "evaluation_queries.json",
+  "summary": {
+    "total": 8,
+    "passed": 3,
+    "partial": 3,
+    "failed": 2
+  },
+  "results": [
+    {
+      "query": "NIHR grants for clinical trials",
+      "expected": [
+        "NIHR",
+        "clinical"
+      ],
+      "matches": [
+        "NIHR"
+      ],
+      "score": 1,
+      "total_expected": 2,
+      "passed": false,
+      "total_hits": 10,
+      "notes": "Should return NIHR grants related to clinical trials"
+    },
+    {
+      "query": "Innovate UK AI and machine learning",
+      "expected": [
+        "Innovate UK",
+        "AI"
+      ],
+      "matches": [],
+      "score": 0,
+      "total_expected": 2,
+      "passed": false,
+      "total_hits": 10,
+      "notes": "Should return Innovate UK competitions for AI/ML"
+    },
+    {
+      "query": "health technology research funding",
+      "expected": [
+        "health"
+      ],
+      "matches": [],
+      "score": 0,
+      "total_expected": 1,
+      "passed": false,
+      "total_hits": 10,
+      "notes": "Should return health-related funding opportunities"
+    },
+    {
+      "query": "grants over \u00a31M for medical devices",
+      "expected": [
+        "medical"
+      ],
+      "matches": [
+        "medical"
+      ],
+      "score": 1,
+      "total_expected": 1,
+      "passed": true,
+      "total_hits": 10,
+      "notes": "Should return high-value medical device grants"
+    },
+    {
+      "query": "NIHR i4i programs",
+      "expected": [
+        "NIHR",
+        "i4i"
+      ],
+      "matches": [
+        "NIHR",
+        "i4i"
+      ],
+      "score": 2,
+      "total_expected": 2,
+      "passed": true,
+      "total_hits": 10,
+      "notes": "Should return NIHR Invention for Innovation programs"
+    },
+    {
+      "query": "early-stage SME funding",
+      "expected": [
+        "SME"
+      ],
+      "matches": [
+        "SME"
+      ],
+      "score": 1,
+      "total_expected": 1,
+      "passed": true,
+      "total_hits": 10,
+      "notes": "Should return funding suitable for early-stage SMEs"
+    },
+    {
+      "query": "digital health innovation",
+      "expected": [
+        "digital",
+        "health"
+      ],
+      "matches": [
+        "health"
+      ],
+      "score": 1,
+      "total_expected": 2,
+      "passed": false,
+      "total_hits": 10,
+      "notes": "Should return digital health innovation grants"
+    },
+    {
+      "query": "collaborative research partnerships",
+      "expected": [
+        "collaborative",
+        "partnership"
+      ],
+      "matches": [
+        "partnership"
+      ],
+      "score": 1,
+      "total_expected": 2,
+      "passed": false,
+      "total_hits": 10,
+      "notes": "Should return grants requiring partnerships"
+    }
+  ]
+}
